@@ -59,8 +59,8 @@ class RefKFDMDGeneratorPipeline(KeyframePipelineMixin, DiffusionPipeline, WanLor
             transformer: WorldStereoRefSModel,
             vae: AutoencoderKLWan,
             scheduler,
-            device,
-            vae_compile: bool = False,
+            device=None,                 # default -> diffusers _get_signature_keys treats as optional
+            vae_compile: bool = False,    # (NOT an expected module) so enable_model_cpu_offload's
             vae_compile_mode: str = "max-autotune"
     ):
         super().__init__()

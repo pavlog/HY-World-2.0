@@ -206,11 +206,8 @@ class KeyframePipelineMixin:
         image_embeds=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        if image is not None and image_embeds is not None:
-            raise ValueError(
-                f"Cannot forward both `image`: {image} and `image_embeds`: {image_embeds}. Please make sure to"
-                " only forward one of the two."
-            )
+        # relaxed: we intentionally pass BOTH image (for prepare_latents) and a precomputed image_embeds (to skip
+        # encode_image so CLIP can be parked on CPU -> ~1.2GB freed for the memory-conditioned denoise).
         if image is None and image_embeds is None:
             raise ValueError(
                 "Provide either `image` or `prompt_embeds`. Cannot leave both `image` and `image_embeds` undefined."

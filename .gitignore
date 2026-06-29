@@ -10,3 +10,24 @@ skyseg.onnx
 *.ckpt
 CLAUDE.md
 commands.sh
+
+# ---- worldgen tooling: regenerable artifacts / outputs (do NOT commit) ----
+*.log
+*.mp4
+*.npy
+*.pt
+*.ply
+*.spz
+*.glb
+/_ws_*.png
+/_ws_*.jpg
+_ws_*_render/
+_ws_shade*/
+*.egg-info/
+*.so
+*.pyd
+**/build/
+# copied-in third-party (regenerable): glm for the gsplat fork build
+hyworld2/worldgen/third_party/gsplat_maskgaussian/**/glm/
+# local prompt cache
+_ws_prompt_cache/

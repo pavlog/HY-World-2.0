@@ -1710,7 +1710,8 @@ class Runner:
                                 o3d.io.write_triangle_mesh(
                                     f"{self.ply_dir}/fuse_simplified.ply", mesh_simplified)
 
-                    dist.barrier()
+                    if self.world_size > 1:
+                        torch.distributed.barrier()  # single-GPU/Windows: no group, and `dist` is unbound here
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:

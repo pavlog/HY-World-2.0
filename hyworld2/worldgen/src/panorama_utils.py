@@ -34,7 +34,21 @@ def subdivide_icosahedron(subdivisions: int = 1) -> np.ndarray:
     Returns:
         vertices: (N, 3) Subdivided vertex coordinates on the unit sphere.
     """
-    vertices, faces = utils3d.numpy.icosahedron()
+    # Hardcoded unit icosahedron (12 verts, 20 faces) — older utils3d lacks utils3d.numpy.icosahedron().
+    try:
+        vertices, faces = utils3d.numpy.icosahedron()
+    except AttributeError:
+        _t = (1.0 + 5.0 ** 0.5) / 2.0
+        vertices = np.array([
+            [-1, _t, 0], [1, _t, 0], [-1, -_t, 0], [1, -_t, 0],
+            [0, -1, _t], [0, 1, _t], [0, -1, -_t], [0, 1, -_t],
+            [_t, 0, -1], [_t, 0, 1], [-_t, 0, -1], [-_t, 0, 1]], dtype=np.float64)
+        vertices = vertices / np.linalg.norm(vertices, axis=1, keepdims=True)
+        faces = np.array([
+            [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+            [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+            [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+            [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]], dtype=np.int64)
 
     # Convert to a list so new vertices can be appended dynamically.
     vertices_list = [v for v in vertices]

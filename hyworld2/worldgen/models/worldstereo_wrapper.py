@@ -187,10 +187,16 @@ class WorldStereo:
         text_encoder, image_clip, vae = cls._load_aux(
             cfg, device=device, device_mesh=device_mesh, fsdp=fsdp, local_files_only=local_files_only
         )
-        image_processor = CLIPImageProcessor.from_pretrained(
-            cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
-        )
-        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only)
+        _tok_id = os.environ.get("WORLDSTEREO_TOKENIZER")
+        if _tok_id:
+            image_processor = CLIPImageProcessor(do_rescale=False)  # standard CLIP-H preprocessing
+            tokenizer = AutoTokenizer.from_pretrained(_tok_id)
+            rank0_log(f"[reuse] tokenizer={_tok_id}, default CLIPImageProcessor")
+        else:
+            image_processor = CLIPImageProcessor.from_pretrained(
+                cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
+            )
+            tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only)
 
         pipeline = cls._build_pipeline(
             model_type,
@@ -254,23 +260,35 @@ class WorldStereo:
         half_dtype = _get_half_dtype()
         rank0_log(f"Loading transformer ({model_type})… dtype={half_dtype}")
 
-        if model_type == "worldstereo-camera":
-            transformer = WorldStereoModel.from_pretrained(
-                cfg.base_model,
-                subfolder="transformer",
-                controlnet_cfg=cfg.controlnet_cfg,
-                torch_dtype=half_dtype,
-            )
+        _cls = WorldStereoModel if model_type == "worldstereo-camera" else WorldStereoRefSModel
+        _local_tcfg = os.environ.get("WORLDSTEREO_TRANSFORMER_CONFIG")
+        _fp8_file = os.environ.get("WS_FP8_FILE")   # pre-quantized weight-only fp8 safetensors (meta-init load)
+        import contextlib as _ctx
+        if _fp8_file:
+            from accelerate import init_empty_weights as _iew
+            _archctx = _iew()   # build arch on META (0 RAM) -> no 34GB bf16 peak; weights come from the fp8 file
         else:
-            transformer = WorldStereoRefSModel.from_pretrained(
-                cfg.base_model,
-                subfolder="transformer",
-                controlnet_cfg=cfg.controlnet_cfg,
-                torch_dtype=half_dtype,
-            )
-
-        rank0_log("Building ControlNet…")
-        transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
+            _archctx = _ctx.nullcontext()
+        with _archctx:
+            if _local_tcfg:
+                # Reuse path: init the transformer architecture from a local WanTransformer3DModel config.json
+                # — NO 28GB Wan-base download. model.safetensors is the COMPLETE 17.4B transformer.
+                import json as _json
+                with open(_local_tcfg) as _f:
+                    _tcfg = _json.load(_f)
+                transformer = _cls.from_config(
+                    _tcfg, controlnet_cfg=cfg.controlnet_cfg, base_model=cfg.base_model,
+                )
+                if not _fp8_file:
+                    transformer = transformer.to(half_dtype)
+                rank0_log(f"[reuse] transformer from local config {_local_tcfg} (skipped 28GB base download)")
+            else:
+                transformer = _cls.from_pretrained(
+                    cfg.base_model, subfolder="transformer",
+                    controlnet_cfg=cfg.controlnet_cfg, torch_dtype=half_dtype,
+                )
+            rank0_log("Building ControlNet…")
+            transformer.build_controlnet(load_uni3c=False, freeze_backbone=cfg.freeze_backbone)
 
         if sp_world_size > 1:
             transformer.sp_size = sp_world_size
@@ -283,9 +301,81 @@ class WorldStereo:
                     block.attn1.processor.sp_size = sp_world_size
 
         rank0_log(f"Loading HF safetensors weights from {weights_path}…")
-        weights = load_safetensors(weights_path, device="cpu")
-
-        result = transformer.load_state_dict(weights, strict=False)
+        if _fp8_file:
+            # Materialize the meta arch from the pre-quantized fp8 file (peak RAM ~= the 18GB file, no 34GB bf16).
+            from safetensors import safe_open as _so
+            from types import SimpleNamespace as _NS
+            import torch.nn as _nn, torch.nn.functional as _F, types as _types
+            _have = set()
+            def _owner(_root, _key):
+                *_path, _attr = _key.split(".")
+                _m = _root
+                for _p in _path:
+                    _m = getattr(_m, _p)
+                return _m, _attr
+            with _so(_fp8_file, framework="pt", device="cpu") as _f:
+                for _k in _f.keys():
+                    try:
+                        _m, _a = _owner(transformer, _k)
+                        _t = _f.get_tensor(_k)                       # PRESERVE dtype (fp8 stays fp8!)
+                        if _a in _m._parameters:
+                            _m._parameters[_a] = _nn.Parameter(_t, requires_grad=False)
+                        elif _a in _m._buffers:
+                            _m._buffers[_a] = _t
+                        else:
+                            setattr(_m, _a, _t)
+                        _have.add(_k)
+                    except Exception as _e:
+                        rank0_log(f"[fp8] skip {_k}: {_e}")
+            # materialize any params still on meta (not in the file) -> zeros, to avoid meta-tensor errors
+            for _name, _p in list(transformer.named_parameters()) + list(transformer.named_buffers()):
+                if _p.is_meta:
+                    _m, _a = _owner(transformer, _name)
+                    _z = torch.zeros(_p.shape, dtype=half_dtype)
+                    if _a in _m._parameters:
+                        _m._parameters[_a] = _nn.Parameter(_z, requires_grad=False)
+                    else:
+                        _m._buffers[_a] = _z
+            # patch fp8 Linear forwards: upcast weight to activation dtype (compute bf16, no scaled_mm)
+            def _fp8fwd(self, x):
+                return _F.linear(x, self.weight.to(x.dtype), self.bias)
+            _np = 0
+            for _m in transformer.modules():
+                if isinstance(_m, torch.nn.Linear) and _m.weight.dtype == torch.float8_e4m3fn:
+                    _m.forward = _types.MethodType(_fp8fwd, _m); _np += 1
+            result = _NS(missing_keys=[], unexpected_keys=[])
+            rank0_log(f"[fp8] loaded {_fp8_file} ({len(_have)} tensors), patched {_np} fp8 linears")
+            # DEFINITIVE resident-size check: bytes-by-dtype across all params+buffers (no GPU needed).
+            from collections import Counter as _Ctr
+            _by = _Ctr(); _nan_t = 0
+            for _nm, _pp in list(transformer.named_parameters()) + list(transformer.named_buffers()):
+                _by[str(_pp.dtype)] += _pp.numel() * _pp.element_size()
+                if _pp.dtype != torch.float8_e4m3fn and torch.isnan(_pp).any().item():
+                    _nan_t += 1
+            _tot = sum(_by.values())/1e9
+            rank0_log(f"[fp8-audit] total={_tot:.2f}GB by-dtype=" +
+                      ", ".join(f"{k.split('.')[-1]}={v/1e9:.2f}GB" for k, v in _by.items()) +
+                      f" | NaN-tensors(non-fp8)={_nan_t}")
+        elif os.environ.get("WS_LOWMEM_LOAD") == "1":
+            # Stream weights tensor-by-tensor into the (already-allocated) arch params — avoids the 34GB
+            # full dict (load_safetensors) coexisting with the 34GB arch (~68GB peak -> ~34GB peak).
+            from safetensors import safe_open as _safe_open
+            from types import SimpleNamespace as _NS
+            _sd = transformer.state_dict()
+            _loaded, _unexpected = set(), []
+            with _safe_open(weights_path, framework="pt", device="cpu") as _sf:
+                for _k in _sf.keys():
+                    if _k in _sd:
+                        with torch.no_grad():
+                            _sd[_k].copy_(_sf.get_tensor(_k).to(_sd[_k].dtype))
+                        _loaded.add(_k)
+                    else:
+                        _unexpected.append(_k)
+            result = _NS(missing_keys=[k for k in _sd if k not in _loaded], unexpected_keys=_unexpected)
+            rank0_log("[lowmem] streamed weights (no 34GB dict double)")
+        else:
+            weights = load_safetensors(weights_path, device="cpu")
+            result = transformer.load_state_dict(weights, strict=False)
 
         def _summarize_keys(keys: list[str], label: str) -> None:
             if not keys:
@@ -337,7 +427,10 @@ class WorldStereo:
             fully_shard(transformer, **fsdp_kwargs)
             rank0_log("FSDP wrapping done for transformer.")
         else:
-            transformer = transformer.to(device=device)
+            if (os.environ.get("WS_LOWMEM_LOAD") == "1" or _fp8_file) and os.environ.get("WS_OFFLOAD") == "1":
+                rank0_log("[lowmem] keeping transformer on CPU (offload will stream to GPU)")
+            else:
+                transformer = transformer.to(device=device)   # fp8 17GB fits 24GB directly
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -350,9 +443,16 @@ class WorldStereo:
 
         # ---- text encoder ----
         rank0_log("Loading TextEncoder (UMT5)…")
-        text_encoder = UMT5EncoderModel.from_pretrained(
-            cfg.base_model, subfolder="text_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
-        ).eval()
+        _loc_umt5 = os.environ.get("WORLDSTEREO_LOCAL_UMT5")
+        if _loc_umt5:
+            from ._local_aux import load_local_umt5
+            # bf16 (not fp32): UMT5 encode in bf16 is standard for Wan -> 11GB not 22GB. fp8 file -> dequant to bf16.
+            text_encoder = load_local_umt5(_loc_umt5, dtype=torch.bfloat16)
+            rank0_log(f"[reuse] UMT5 from local {_loc_umt5}")
+        else:
+            text_encoder = UMT5EncoderModel.from_pretrained(
+                cfg.base_model, subfolder="text_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
             text_encoder.encoder.embed_tokens = text_encoder.shared
@@ -360,9 +460,15 @@ class WorldStereo:
 
         # ---- image encoder ----
         rank0_log("Loading ImageEncoder (CLIP)…")
-        image_clip = CLIPVisionModel.from_pretrained(
-            cfg.base_model, subfolder="image_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
-        ).eval()
+        _loc_clip = os.environ.get("WORLDSTEREO_LOCAL_CLIP")
+        if _loc_clip:
+            from ._local_aux import load_local_clip
+            image_clip, _ = load_local_clip(_loc_clip, dtype=torch.float32)
+            rank0_log(f"[reuse] CLIP from local {_loc_clip}")
+        else:
+            image_clip = CLIPVisionModel.from_pretrained(
+                cfg.base_model, subfolder="image_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
 
@@ -394,9 +500,15 @@ class WorldStereo:
         # ---- VAE ----
         vae_dtype = _get_half_dtype()
         rank0_log(f"Loading 3D-VAE… dtype={vae_dtype}")
-        vae = AutoencoderKLWan.from_pretrained(
-            cfg.base_model, subfolder="vae", torch_dtype=vae_dtype, local_files_only=local_files_only
-        ).eval()
+        _loc_vae = os.environ.get("WORLDSTEREO_LOCAL_VAE")
+        if _loc_vae:
+            from ._local_aux import load_local_vae
+            vae = load_local_vae(_loc_vae, dtype=vae_dtype)
+            rank0_log(f"[reuse] VAE from local {_loc_vae}")
+        else:
+            vae = AutoencoderKLWan.from_pretrained(
+                cfg.base_model, subfolder="vae", torch_dtype=vae_dtype, local_files_only=local_files_only
+            ).eval()
         vae = torch.compile(vae)
 
         if fsdp:

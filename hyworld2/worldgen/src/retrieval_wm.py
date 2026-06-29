@@ -786,8 +786,9 @@ class PanoramaMemoryBank:
 
         def _load_item(args):
             img_p, dep_p, cam_dict = args
-            key = img_p.split('/')[-1].split('.')[0]
-            view_id, traj_id = img_p.split('/')[-4], img_p.split('/')[-3]
+            _p = img_p.replace('\\', '/')                      # Windows: glob returns backslashes
+            key = _p.split('/')[-1].split('.')[0]
+            view_id, traj_id = _p.split('/')[-4], _p.split('/')[-3]
             fname = f"{view_id}/{traj_id}/{key}"
             return (
                 np.array(cam_dict[key]['extrinsic']),

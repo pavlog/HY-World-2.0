@@ -88,7 +88,7 @@ if __name__ == '__main__':
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="cpu:gloo,cuda:nccl",
+        backend="gloo" if os.name == "nt" else "cpu:gloo,cuda:nccl",  # Windows has no NCCL; single-proc gloo
         rank=rank,
         world_size=world_size,
     )
@@ -242,6 +242,7 @@ if __name__ == '__main__':
                                glob(f"{scene_path}/render_results/reconstruct*/*/{result_name}_result.mp4") +
                                glob(f"{scene_path}/render_results/wonder*/*/{result_name}_result.mp4"))
 
+        video_paths = [p.replace("\\", "/") for p in video_paths]  # Windows: glob returns backslashes
         video_paths = sorted(video_paths, key=lambda x: (x.split("/")[-3], x.split("/")[-2]))
         video_paths = video_paths[rank::world_size]
 
