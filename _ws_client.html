@@ -55,6 +55,7 @@
   <div><span id="status">no project</span></div>
   <div class="row"><button onclick="undo()">Undo</button><button onclick="resetChain()">Reset</button><span style="margin-left:auto">steps: <b id="stepcount">0</b></span></div>
   <div class="row"><button onclick="downloadCameras()" title="Blender-ready camera path JSON">⬇ Camera path</button><button onclick="downloadPano()" title="Tweaked panorama as RGBA PNG (erased = transparent)">⬇ Pano (PNG)</button></div>
+  <div class="row"><button onclick="downloadMesh()" title="High-quality pano mesh GLB (Poisson depth-10; generated from current cloud)" style="width:100%">⬇ Pano Mesh — HQ GLB</button></div>
 </div>
 <div id="player" class="panel" style="top:10px;right:10px;width:300px;z-index:11">
   <img id="pimg" style="width:100%;border-radius:5px;display:block;background:#000;border:2px solid #ff9a3c">
@@ -118,6 +119,9 @@ async function undoErase(){return undo();}   // unified undo timeline (steps + e
 async function downloadCameras(){const r=await api('/download_cameras');if(!r||!r.frames||!r.frames.length){setStatus('no camera path yet');return;}
   const blob=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='camera_path_blender.json';a.click();setStatus('downloaded '+r.frames.length+' cameras (Blender-ready)');}
 function downloadPano(){const a=document.createElement('a');a.href='/download_pano';a.download='pano_tweaked.png';a.click();setStatus('downloading tweaked pano (RGBA)…');}
+function downloadMesh(){if(scaffoldCloud.length===0){alert('open a project first');return;}
+  setStatus('generating HQ pano mesh (Poisson depth-10, ~15s) → download starts when ready…');
+  const a=document.createElement('a');a.href='/download_mesh?force=1';a.download='pano_mesh.glb';document.body.appendChild(a);a.click();a.remove();}
 
 function basis(yw,pt){const f=[Math.cos(pt)*Math.cos(yw),Math.cos(pt)*Math.sin(yw),Math.sin(pt)];
   let r=[-f[1],f[0],0];const rl=Math.hypot(r[0],r[1],r[2])||1;r=[r[0]/rl,r[1]/rl,r[2]/rl];

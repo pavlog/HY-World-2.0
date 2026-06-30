@@ -11,7 +11,7 @@ Endpoints (all JSON):
   POST /step {frames:[w2c..],intrinsic,prompt,width,height} -> {frames:[b64png], step, new_pose, secs}
   POST /reset / POST /undo                    -> clear / pop last step
 """
-import sys, os, json, time, base64, shutil, gc, glob
+import sys, os, json, time, base64, shutil, gc, glob, threading, functools, hashlib
 import numpy as np, cv2, torch, trimesh
 sys.argv = [sys.argv[0]]
 import _ws_serve as WS
@@ -42,11 +42,66 @@ S = {"proj": None, "pano": None, "gpts": None, "gcol": None, "last_png": None, "
 PIPE.image_encoder.to("cpu")
 PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()
 
+# ---- idle GPU auto-eviction: after IDLE_SECONDS with no GPU request, park transformer+VAE on CPU + empty_cache
+#      (frees VRAM for other tasks). Next GPU request lazily restores. Uses the same .to() moves /step already does.
+IDLE_SECONDS = 60
+GPU = {"loaded": True, "busy": 0, "last": time.time()}
+GPU_LOCK = threading.Lock()
+
+def _gpu_ensure():
+    with GPU_LOCK:
+        GPU["busy"] += 1; GPU["last"] = time.time()
+        if not GPU["loaded"]:
+            PIPE.vae.to(dev)                       # transformer is restored by the gen path (tr_on_gpu flag)
+            GPU["loaded"] = True; logln("GPU: resumed (VAE back on GPU)")
+
+def _gpu_done():
+    with GPU_LOCK:
+        GPU["busy"] = max(0, GPU["busy"] - 1); GPU["last"] = time.time()
+
+def gpu_endpoint(fn):
+    @functools.wraps(fn)
+    def w(*a, **k):
+        if request.method == "OPTIONS":
+            return fn(*a, **k)
+        _gpu_ensure()
+        try:
+            return fn(*a, **k)
+        finally:
+            _gpu_done()
+    return w
+
+def _gpu_watchdog():
+    while True:
+        time.sleep(5)
+        with GPU_LOCK:
+            if GPU["loaded"] and GPU["busy"] == 0 and (time.time() - GPU["last"]) > IDLE_SECONDS:
+                try:
+                    PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False
+                    PIPE.vae.to("cpu"); torch.cuda.empty_cache()
+                    GPU["loaded"] = False
+                    logln(f"GPU idle {IDLE_SECONDS}s -> parked transformer+VAE on CPU (VRAM freed)")
+                except Exception as e:
+                    logln(f"GPU evict error: {e}")
+threading.Thread(target=_gpu_watchdog, daemon=True).start()
+
 
 def encode_prompt_cached(prompt):
-    if prompt in PE_CACHE:
-        logln("prompt cached → skip encode")
-        return PE_CACHE[prompt]
+    cpath = f"{WS.PROMPT_CACHE}/{hashlib.md5((prompt + '||' + NEG).encode()).hexdigest()}.pt"
+    if prompt in PE_CACHE:                                       # in-memory (CPU) hit
+        pe, ne = PE_CACHE[prompt]
+        logln("prompt cached (mem) → skip encode")
+        return pe.to(dev), (ne.to(dev) if ne is not None else None)
+    if os.path.exists(cpath):                                   # DISK hit -> no umt5 swap (survives restart; shared with run_one)
+        try:
+            os.utime(cpath, None)                                # LRU touch
+            d = torch.load(cpath, map_location="cpu")
+            pe, ne = d["pe"], d["ne"]
+            PE_CACHE[prompt] = (pe, ne)
+            logln("prompt cached (disk) → skip umt5 swap")
+            return pe.to(dev), (ne.to(dev) if ne is not None else None)
+        except Exception as e:
+            logln(f"disk prompt-cache load failed ({e}) → re-encoding")
     logln("new prompt → encoding (umt5 swap, ~40s)…")
     PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()   # umt5(11)+transformer(17)=30.8 -> swap
     PIPE.text_encoder.to(dev)
@@ -55,7 +110,12 @@ def encode_prompt_cached(prompt):
                                     num_videos_per_prompt=1, max_sequence_length=512, device=dev)
     PIPE.text_encoder.to("cpu"); torch.cuda.empty_cache()
     PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True
-    PE_CACHE[prompt] = (pe, ne)
+    try:
+        torch.save({"pe": pe.cpu(), "ne": (ne.cpu() if ne is not None else None)}, cpath); WS._cache_evict()
+        logln("prompt encoded → saved to disk cache")
+    except Exception as e:
+        logln(f"disk prompt-cache save failed: {e}")
+    PE_CACHE[prompt] = (pe.cpu(), ne.cpu() if ne is not None else None)
     return pe, ne
 
 
@@ -334,6 +394,7 @@ def fastmesh():
 
 
 @app.route('/accumulate', methods=['POST', 'OPTIONS'])
+@gpu_endpoint
 def accumulate():
     """Incrementally fuse ONLY the steps not yet accumulated into the coverage cloud (undo-aware),
     then return a fast Poisson preview. Cheap vs /world_mesh (which re-fuses every step). Body: {depth:8}."""
@@ -403,6 +464,7 @@ def accumulate():
 
 
 @app.route('/world_mesh', methods=['POST', 'OPTIONS'])
+@gpu_endpoint
 def world_mesh():
     if request.method == 'OPTIONS':
         return ('', 204)
@@ -482,6 +544,7 @@ def projects():
 
 
 @app.route('/create_project', methods=['POST', 'OPTIONS'])
+@gpu_endpoint
 def create_project():
     if request.method == 'OPTIONS':
         return ('', 204)
@@ -559,6 +622,27 @@ def download_pano():
     arr[..., 3] = alpha
     buf = io.BytesIO(); Image.fromarray(arr).save(buf, format="PNG"); buf.seek(0)
     return send_file(buf, mimetype="image/png", as_attachment=True, download_name="pano_tweaked.png")
+
+
+@app.route('/download_mesh', methods=['GET', 'OPTIONS'])
+def download_mesh():
+    """Download the HIGH-QUALITY pano mesh (GLB). Generates it (Poisson depth-10) if not present, else sends cached.
+    ?force=1 regenerates from the current cloud (use after editing)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if S["gpts"] is None:
+        return ('no project open', 404)
+    from flask import send_file
+    glb = f"{S['proj']}/mesh.glb"
+    force = request.args.get("force") in ("1", "true")
+    if force or not os.path.exists(glb):
+        import open3d as o3d
+        logln("download_mesh: generating HQ pano mesh (Poisson depth=10)…")
+        V = S["gpts"].cpu().numpy().astype(np.float64); C = np.clip(S["gcol"].cpu().numpy().astype(np.float64), 0, 1)
+        pcd = o3d.geometry.PointCloud(); pcd.points = o3d.utility.Vector3dVector(V); pcd.colors = o3d.utility.Vector3dVector(C)
+        diag = float(np.linalg.norm(V.max(0) - V.min(0)))
+        _mesh_payload(pcd, f"{S['proj']}/mesh", diag * 0.004, depth=10, fast=False)
+    return send_file(glb, mimetype="model/gltf-binary", as_attachment=True, download_name="pano_mesh.glb")
 
 
 @app.route('/undo', methods=['POST', 'OPTIONS'])
@@ -670,6 +754,7 @@ def undo_erase():
 
 
 @app.route('/step', methods=['POST', 'OPTIONS'])
+@gpu_endpoint
 def step():
     if request.method == 'OPTIONS':
         return ('', 204)
