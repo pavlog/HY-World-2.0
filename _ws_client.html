@@ -1,8 +1,10 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>WorldStereo Step Tool</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2308080b'/%3E%3Cg fill='none' stroke='%23ff9a3c' stroke-width='2'%3E%3Ccircle cx='16' cy='16' r='9'/%3E%3Cellipse cx='16' cy='16' rx='9' ry='3.6'/%3E%3Cline x1='16' y1='7' x2='16' y2='25'/%3E%3C/g%3E%3Ccircle cx='16' cy='16' r='2.4' fill='%23ff9a3c'/%3E%3C/svg%3E">
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#08080b;font-family:system-ui,sans-serif;color:#ddd}
-  #c{display:block;position:fixed;top:0;left:0}
+  #c{display:block;position:fixed;top:0;left:0;z-index:0}
+  #ov{display:block;position:fixed;top:0;left:0;z-index:1;pointer-events:none}
   .panel{position:fixed;background:rgba(15,15,20,.92);border-radius:8px;padding:12px 14px;font-size:13px;line-height:1.5;z-index:10}
   #ui{top:10px;left:10px;width:300px}
   #ui h3{margin:0 0 6px;font-size:14px;color:#ff9a3c}
@@ -24,16 +26,15 @@
   hr{border:0;border-top:1px solid #333;margin:8px 0}
 </style></head><body>
 <canvas id="c"></canvas>
+<canvas id="ov"></canvas>
 <div id="ui" class="panel">
-  <h3>WorldStereo Step Tool</h3>
+  <h3>WorldStereo Step Tool <span style="font-size:10px;color:#9af;font-weight:400">· WebGL</span></h3>
   <div class="row"><select id="projsel"></select><button onclick="openProj()">Open</button></div>
-  <div class="row"><input id="newname" placeholder="new project name"><button onclick="createProj()" style="white-space:nowrap">+ New</button></div>
-  <div class="row"><input id="newpano" placeholder="pano path (D:/.../panorama.png)" value="D:/_world_hangar/panorama.png" style="flex:1"><button onclick="browsePano()" title="Browse for panorama file" style="white-space:nowrap">📁 Browse</button></div>
-  <div style="font-size:11px;opacity:.55;margin:-2px 0 2px">equirect 2:1 · max <b>3840×1920</b> (bigger is downscaled) · RGBA PNG → transparent = erased</div>
+  <div class="row"><button onclick="openNewModal()" style="width:100%">+ New project…</button></div>
   <hr>
   <div>Click scene → <b>WASD</b>/<b>QE</b> move, drag-look. Position the camera = where this step ENDS.</div>
   <div id="pos">pos: -</div>
-  <div>point size: <input type="range" id="psize" min="1" max="16" value="2" oninput="PSIZE=+this.value;document.getElementById('psv').textContent=this.value" style="width:130px;vertical-align:middle"> <span id="psv">2</span>px</div>
+  <div>point size: <input type="range" id="psize" min="1" max="16" value="2" oninput="PSIZE=+this.value;document.getElementById('psv').textContent=this.value;if(window.GL)GL.setPointSize(+this.value)" style="width:130px;vertical-align:middle"> <span id="psv">2</span>px</div>
   <div>bg: <input type="color" id="bgpick" value="#08080b" oninput="setBG(this.value)" style="width:32px;height:20px;padding:0;vertical-align:middle">
     <button onclick="setBG('#08080b')" style="padding:2px 6px">dark</button>
     <button onclick="setBG('#808088')" style="padding:2px 6px">grey</button>
@@ -49,7 +50,7 @@
   <div><button onclick="genMesh('/mesh','meshing pano')" style="width:100%">⬢ Generate Pano Mesh</button></div>
   <div><button onclick="genMesh('/world_mesh','meshing world (MoGe, ~1min)')" style="width:100%">⬢ Generate World Mesh (from gen)</button></div>
   <div><button onclick="genMesh('/accumulate','updating coverage (MoGe new steps + fast Poisson)')" style="width:100%">⬢ Refresh Coverage (fast preview)</button></div>
-  <div style="font-size:12px"><label><input type="checkbox" id="meshchk" disabled onchange="toggleMesh(this)"> show mesh</label> <label style="margin-left:6px"><input type="checkbox" id="shadedchk" disabled onchange="shadedMode=this.checked;applyDisplay()"> shaded (normals)</label></div>
+  <div style="font-size:12px"><label><input type="checkbox" id="meshchk" disabled onchange="toggleMesh(this)"> show mesh (solid)</label> <label style="margin-left:6px"><input type="checkbox" id="cloudchk" checked onchange="if(window.GL)GL.showCloud(this.checked)"> show cloud</label></div>
   <textarea id="prompt">sci-fi spaceship hangar interior, cinematic, high detail</textarea>
   <button id="compute" onclick="computeStep()">▶ Compute Step (6f)</button>
   <div><span id="status">no project</span></div>
@@ -67,13 +68,34 @@
 </div>
 <div id="logpanel" class="panel" style="bottom:94px;right:10px;width:340px;max-height:150px;overflow:auto;font-family:monospace;font-size:10px;color:#8c8;white-space:pre-wrap;z-index:10"></div>
 <div id="film"></div>
+<div id="newmodal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;align-items:center;justify-content:center">
+  <div class="panel" style="position:relative;width:430px;max-width:92vw">
+    <h3 style="margin:0 0 8px;color:#ff9a3c;font-size:15px">New project</h3>
+    <div style="margin-bottom:2px">Project name</div>
+    <input id="newname" placeholder="my-world" onkeydown="if(event.key==='Enter')doCreate()">
+    <div style="margin:10px 0 3px">Panorama image <span style="opacity:.55;font-size:11px">· equirect 2:1 · max 3840×1920 · RGBA = alpha mask</span></div>
+    <label id="droparea" style="display:block;border:1.5px dashed #555;border-radius:8px;padding:16px;text-align:center;cursor:pointer;background:#14141a"
+      ondragover="event.preventDefault();this.style.borderColor='#ff9a3c'" ondragleave="this.style.borderColor='#555'"
+      ondrop="event.preventDefault();this.style.borderColor='#555';if(event.dataTransfer.files[0])setPano(event.dataTransfer.files[0])">
+      <input id="panofile" type="file" accept="image/*" style="display:none" onchange="onPanoFile(this)">
+      <div id="dropmsg" style="font-size:12px;opacity:.7">Click or drop an image here…</div>
+      <img id="panoprev" style="display:none;max-width:100%;max-height:190px;border-radius:6px;margin-top:8px">
+    </label>
+    <div style="display:flex;gap:6px;margin-top:12px">
+      <button id="createbtn" onclick="doCreate()" style="flex:1;background:#ff9a3c;color:#111;font-weight:600;padding:8px">Create</button>
+      <button onclick="closeNewModal()">Cancel</button>
+    </div>
+    <div id="newstatus" style="font-size:11px;color:#7fd;margin-top:6px;min-height:14px"></div>
+  </div>
+</div>
 <script>
 const SRV='';   // same-origin (served by the step server)
 const W=832,H=480,FOV=90*Math.PI/180, STEPF=6;
-const cv=document.getElementById('c'),ctx=cv.getContext('2d');
-let CW,CH,img=null,zb=null; function resize(){CW=cv.width=innerWidth;CH=cv.height=innerHeight;img=null;}
+const cv=document.getElementById('c');
+const ov=document.getElementById('ov'),octx=ov.getContext('2d');
+let CW,CH; function resize(){CW=innerWidth;CH=innerHeight;ov.width=CW;ov.height=CH;if(window.GL&&GL.ready)GL.resize(CW,CH);}
 let CLOUD=[],N=0,PSIZE=2,BG=[8,8,11];
-function setBG(hex){BG=[parseInt(hex.slice(1,3),16),parseInt(hex.slice(3,5),16),parseInt(hex.slice(5,7),16)];document.getElementById('bgpick').value=hex;document.body.style.background=hex;}
+function setBG(hex){BG=[parseInt(hex.slice(1,3),16),parseInt(hex.slice(3,5),16),parseInt(hex.slice(5,7),16)];document.getElementById('bgpick').value=hex;document.body.style.background=hex;if(window.GL)GL.setBG(BG[0],BG[1],BG[2]);}
 let cam=[0,0,0],yaw=Math.PI,pitch=0;            // free (aim) camera
 let chainEnd={pos:[0,0,0],yaw:Math.PI,pitch:0}; // last generated endpoint (step START)
 let poseHist=[{pos:[0,0,0],yaw:Math.PI,pitch:0}]; // chainEnd over time, for undo
@@ -83,7 +105,6 @@ let busy=false;
 const keys={};let plock=false,drag=false;
 addEventListener('keydown',e=>{if(e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT')return;keys[e.code]=true;});
 addEventListener('keyup',e=>keys[e.code]=false);
-// drag-to-look (nav) OR box/brush selection (erase modes). Cursor stays visible; no pointer-lock.
 cv.style.cursor='grab';
 let selMode='nav',selBoxes=[],selBrushes=[],curBox=null,brushR=18,slabV=0.2,painting=false;
 cv.addEventListener('mousedown',e=>{if(e.button!==0)return;
@@ -101,21 +122,21 @@ function setMode(m){
   ['nav','box','brush'].forEach(k=>{const b=document.getElementById('mode_'+k);if(b)b.style.outline=(k===m?'2px solid #ff9a3c':'');});
   let msg='mode: '+m+(m==='nav'?'  (drag=look)':'  (drag to select → Push delete)');
   if(m==='box'||m==='brush'){const ns=+(document.getElementById('stepcount').textContent||0);
-    if(ns>0)msg+='   ⚠ '+ns+' clips are from current geometry — edits make them stale (Undo reverts)';}  // soft warning, no wipe
+    if(ns>0)msg+='   ⚠ '+ns+' clips are from current geometry — edits make them stale (Undo reverts)';}
   setStatus(msg);}
-function drawSel(){ctx.save();ctx.lineWidth=1.5;ctx.strokeStyle='#f55';ctx.fillStyle='rgba(255,70,70,.16)';
-  for(const b of selBoxes){ctx.fillRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);ctx.strokeRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);}
-  if(curBox){ctx.strokeRect(curBox[0],curBox[1],curBox[2]-curBox[0],curBox[3]-curBox[1]);}
-  ctx.fillStyle='rgba(255,70,70,.22)';for(const br of selBrushes){ctx.beginPath();ctx.arc(br[0],br[1],br[2],0,7);ctx.fill();}
-  ctx.restore();}
+function drawSel(){octx.save();octx.lineWidth=1.5;octx.strokeStyle='#f55';octx.fillStyle='rgba(255,70,70,.16)';
+  for(const b of selBoxes){octx.fillRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);octx.strokeRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);}
+  if(curBox){octx.strokeRect(curBox[0],curBox[1],curBox[2]-curBox[0],curBox[3]-curBox[1]);}
+  octx.fillStyle='rgba(255,70,70,.22)';for(const br of selBrushes){octx.beginPath();octx.arc(br[0],br[1],br[2],0,7);octx.fill();}
+  octx.restore();}
 async function pushErase(){if(!selBoxes.length&&!selBrushes.length){setStatus('nothing selected');return;}
   const B=basis(yaw,pitch),fx=(W/2)/Math.tan(FOV/2)*(CW/W);startTick('erasing…');
   try{const r=await api('/erase_points',{cam,f:B.f,r:B.r,d:B.d,fx,cx:CW/2,cy:CH/2,cw:CW,ch:CH,boxes:selBoxes,brushes:selBrushes,slab:slabV});
     stopTick();if(r.error){setStatus('erase: '+r.error);return;}
-    if(r.cloud){loadCloud(r.cloud);showingMesh=false;}selBoxes=[];selBrushes=[];setStatus('erased '+(r.erased||0)+' pts');
+    if(r.cloud){loadCloud(r.cloud);}selBoxes=[];selBrushes=[];setStatus('erased '+(r.erased||0)+' pts');
   }catch(e){stopTick();setStatus('erase failed: '+e);}}
 function clearSel(){selBoxes=[];selBrushes=[];curBox=null;setStatus('selection cleared');}
-async function undoErase(){return undo();}   // unified undo timeline (steps + erases in one stack)
+async function undoErase(){return undo();}
 async function downloadCameras(){const r=await api('/download_cameras');if(!r||!r.frames||!r.frames.length){setStatus('no camera path yet');return;}
   const blob=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='camera_path_blender.json';a.click();setStatus('downloaded '+r.frames.length+' cameras (Blender-ready)');}
 function downloadPano(){const a=document.createElement('a');a.href='/download_pano';a.download='pano_tweaked.png';a.click();setStatus('downloading tweaked pano (RGBA)…');}
@@ -136,49 +157,61 @@ function proj(P,B,fx){const x=P[0]-cam[0],y=P[1]-cam[1],z=P[2]-cam[2];const zc=B
 async function api(ep,body){const r=await fetch(SRV+ep,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return r.json();}
 async function refreshProjects(){const r=await api('/projects');const s=document.getElementById('projsel');
   s.innerHTML=r.projects.map(p=>`<option value="${p.name}">${p.name} (${p.steps})</option>`).join('');}
-let scaffoldCloud=[],meshVerts=null,meshNormals=null,meshShaded=null,showingMesh=false,shadedMode=false;
-function applyDisplay(){let s=scaffoldCloud;if(showingMesh&&meshVerts)s=(shadedMode&&meshShaded)?meshShaded:meshVerts;CLOUD=s;N=s.length/6;}
-function loadCloud(flat){scaffoldCloud=flat;applyDisplay();}
-function buildShaded(){if(!meshVerts||!meshNormals)return;const L=[0.4,-0.3,0.85],ll=Math.hypot(L[0],L[1],L[2]),lx=L[0]/ll,ly=L[1]/ll,lz=L[2]/ll;
-  const n=meshVerts.length/6;meshShaded=new Array(n*6);
-  for(let i=0;i<n;i++){const j=i*6,k=i*3;meshShaded[j]=meshVerts[j];meshShaded[j+1]=meshVerts[j+1];meshShaded[j+2]=meshVerts[j+2];
-    const d=Math.abs(meshNormals[k]*lx+meshNormals[k+1]*ly+meshNormals[k+2]*lz),g=Math.round((d*0.78+0.22)*255);
-    meshShaded[j+3]=g;meshShaded[j+4]=g;meshShaded[j+5]=g;}}
+let scaffoldCloud=[],showingMesh=false;
+function applyDisplay(){CLOUD=scaffoldCloud;N=CLOUD.length/6;}
+function loadCloud(flat){scaffoldCloud=flat;applyDisplay();if(window.GL&&GL.ready)GL.setCloud(flat);}
+function meshUrlFor(ep){const m={'/mesh':'mesh.glb','/world_mesh':'world_mesh.glb','/accumulate':'coverage.glb'};return '/pfile/'+(m[ep]||'mesh.glb');}
 async function genMesh(ep,label){if(scaffoldCloud.length===0)return alert('open a project first');
   startTick(label||'meshing');
   try{const r=await api(ep||'/mesh',{});stopTick();
     if(r.error){setStatus('mesh error: '+r.error);return;}
-    meshVerts=r.verts;meshNormals=r.normals;buildShaded();
-    document.getElementById('meshchk').disabled=false;document.getElementById('meshchk').checked=true;showingMesh=true;
-    document.getElementById('shadedchk').disabled=false;applyDisplay();
-    setStatus('mesh: '+r.nverts+' verts, '+r.ntris+' tris → '+r.glb);
+    if(window.GL)GL.loadMesh(meshUrlFor(ep));
+    const c=document.getElementById('meshchk');c.disabled=false;c.checked=true;showingMesh=true;if(window.GL)GL.showMesh(true);
+    setStatus('mesh: '+(r.nverts||'?')+' verts, '+(r.ntris||'?')+' tris (solid GLB loaded)');
   }catch(e){stopTick();setStatus('mesh failed: '+e);}}
-function toggleMesh(cb){showingMesh=cb.checked;applyDisplay();}
-async function reloadCloud(){if(N===0)return;const v=document.getElementById('ptcount').value;startTick('loading cloud');
+function toggleMesh(cb){showingMesh=cb.checked;if(window.GL)GL.showMesh(cb.checked);}
+async function reloadCloud(){if(scaffoldCloud.length===0)return;const v=document.getElementById('ptcount').value;startTick('loading cloud');
   try{const r=await api('/cloud',{n:v==='all'?'all':+v});stopTick();loadCloud(r.cloud);setStatus('cloud: '+((r.cloud.length/6)|0)+' pts');}
   catch(e){stopTick();setStatus('cloud load failed: '+e);}}
 async function openProj(){const name=document.getElementById('projsel').value;if(!name)return;
   setStatus('opening '+name+'…');const r=await api('/open_project',{name});loadCloud(r.cloud);
   document.getElementById('stepcount').textContent=r.steps;resetCam();document.getElementById('film').innerHTML='';
+  if(window.GL)GL.clearMesh();showingMesh=false;document.getElementById('meshchk').checked=false;
   await loadAllFrames();setStatus('project: '+name+' ('+r.steps+' steps) — ▶All to review');}
-async function browsePano(){setStatus('opening file dialog…');try{const r=await api('/browse');if(r&&r.path){document.getElementById('newpano').value=r.path;setStatus('selected: '+r.path);}else setStatus('no file selected');}catch(e){setStatus('browse failed: '+e);}}
-async function createProj(){const name=document.getElementById('newname').value.trim().replace(/^["']|["']$/g,'');
-  const pano=document.getElementById('newpano').value.trim().replace(/^["']|["']$/g,'');
-  if(!name)return alert('enter a project name');startTick('building scaffold (MoGe)');
-  try{const r=await api('/create_project',{name,pano});stopTick();
-    if(r.error){setStatus('error: '+r.error);return alert('server error: '+r.error);}
-    loadCloud(r.cloud);document.getElementById('stepcount').textContent=0;
-    await refreshProjects();document.getElementById('projsel').value=name;resetCam();setStatus('created: '+name+' ('+(r.cloud.length/6|0)+' pts)');
-  }catch(e){stopTick();setStatus('create failed: '+e);alert('create failed — check the pano path exists. '+e);}}
+// ---- New project: in-browser upload (pick locally → multipart POST to server) ----
+let panoFile=null;
+function openNewModal(){panoFile=null;document.getElementById('newname').value='';document.getElementById('panofile').value='';
+  document.getElementById('panoprev').style.display='none';document.getElementById('dropmsg').textContent='Click or drop an image here…';
+  document.getElementById('newstatus').textContent='';document.getElementById('createbtn').disabled=false;
+  document.getElementById('newmodal').style.display='flex';document.getElementById('newname').focus();}
+function closeNewModal(){document.getElementById('newmodal').style.display='none';}
+function onPanoFile(inp){const f=inp.files&&inp.files[0];if(f)setPano(f);}
+function setPano(f){panoFile=f;const img=document.getElementById('panoprev');img.src=URL.createObjectURL(f);img.style.display='block';
+  document.getElementById('dropmsg').textContent=f.name+'  ('+(f.size/1048576).toFixed(1)+' MB)';}
+async function doCreate(){
+  const name=document.getElementById('newname').value.trim().replace(/^["']|["']$/g,'');
+  const ns=document.getElementById('newstatus');
+  if(!name){ns.textContent='enter a project name';return;}
+  if(!panoFile){ns.textContent='choose a panorama image';return;}
+  const fd=new FormData();fd.append('name',name);fd.append('pano',panoFile);
+  document.getElementById('createbtn').disabled=true;ns.textContent='⏳ uploading + building scaffold (MoGe)…';
+  startTick('building scaffold (MoGe)');
+  try{const r=await fetch('/create_project',{method:'POST',body:fd}).then(x=>x.json());stopTick();
+    document.getElementById('createbtn').disabled=false;
+    if(r.error){ns.textContent='error: '+r.error;return;}
+    closeNewModal();loadCloud(r.cloud);document.getElementById('stepcount').textContent=0;if(window.GL)GL.clearMesh();
+    await refreshProjects();document.getElementById('projsel').value=name;resetCam();
+    setStatus('created: '+name+' ('+(r.cloud.length/6|0)+' pts)');
+  }catch(e){stopTick();document.getElementById('createbtn').disabled=false;ns.textContent='create failed: '+e;}}
 function resetCam(){cam=[0,0,0];yaw=Math.PI;pitch=0;chainEnd={pos:[0,0,0],yaw:Math.PI,pitch:0};poseHist=[{pos:[0,0,0],yaw:Math.PI,pitch:0}];}
 async function resetChain(){
   if(!confirm('RESET clears EVERYTHING — all generated steps + accumulated coverage + undo history (back to the cleaned scaffold).\n\n⚠ If you need them, DOWNLOAD FIRST:\n  • ⬇ Camera path (Blender)\n  • ⬇ Pano (PNG)\nThey will be gone after reset.\n\nReset now?'))return;
   await api('/reset',{});document.getElementById('stepcount').textContent=0;document.getElementById('film').innerHTML='';resetCam();
   stopPlay();allFrames=[];setScrubMax();document.getElementById('pimg').src='';document.getElementById('fcount').textContent='0/0';
-  showingMesh=false;await reloadCloud();setStatus('chain reset');}
+  showingMesh=false;if(window.GL)GL.clearMesh();await reloadCloud();setStatus('chain reset');}
 async function undo(){const r=await api('/undo',{});if(r&&r.error){setStatus(r.error);return;}
   document.getElementById('stepcount').textContent=r.steps||0;
-  if(r.cloud){loadCloud(r.cloud);showingMesh=false;}                  // unified: also reflects geometry (erase) undo
+  if(r.cloud){loadCloud(r.cloud);}
   while(poseHist.length-1>(r.steps||0))poseHist.pop();
   const p=poseHist[poseHist.length-1];chainEnd={pos:p.pos.slice(),yaw:p.yaw,pitch:p.pitch};
   await loadAllFrames();setStatus(r.undone===false?'nothing to undo':('undo → '+(r.steps||0)+' steps'));}
@@ -203,13 +236,13 @@ async function computeStep(){
     if(r.error){setStatus('error: '+r.error);busy=false;document.getElementById('compute').disabled=false;return;}
     appendStepFrames(r.frames);addFilm(r.frames[r.frames.length-1],r.step);
     document.getElementById('stepcount').textContent=r.step;
-    chainEnd={pos:b.pos.slice(),yaw:b.yaw,pitch:b.pitch};   // advance chain to where we aimed
+    chainEnd={pos:b.pos.slice(),yaw:b.yaw,pitch:b.pitch};
     poseHist.push({pos:b.pos.slice(),yaw:b.yaw,pitch:b.pitch});
     setStatus('step '+r.step+' done ('+r.secs+'s gen, '+((performance.now()-t0)/1000).toFixed(0)+'s total)');
   }catch(e){stopTick();setStatus('failed: '+e);}
   busy=false;document.getElementById('compute').disabled=false;
 }
-// ---- full-flythrough player (all steps stitched, overlap-trimmed) ----
+// ---- full-flythrough player ----
 let allFrames=[],playTimer=null,playIdx=0,playing=false;
 function setScrubMax(){document.getElementById('scrub').max=Math.max(0,allFrames.length-1);}
 function showFrameAt(i){if(!allFrames.length){document.getElementById('fcount').textContent='0/0';return;}
@@ -225,7 +258,7 @@ async function loadAllFrames(){const r=await api('/frames',{});allFrames=r.frame
   if(allFrames.length)showFrameAt(allFrames.length-1);else{document.getElementById('pimg').src='';document.getElementById('fcount').textContent='0/0';}}
 function addFilm(b64,step){const f=document.getElementById('film');const img=new Image();img.src='data:image/png;base64,'+b64;img.title='step '+step;f.appendChild(img);f.scrollLeft=f.scrollWidth;}
 
-// ---- render loop ----
+// ---- render loop: WebGL (cloud+mesh) on #c, 2D overlay (markers+selection) on #ov ----
 function frame(){
   const B=basis(yaw,pitch),sp=0.025;
   if(keys['KeyW']){cam[0]+=B.f[0]*sp;cam[1]+=B.f[1]*sp;cam[2]+=B.f[2]*sp;}
@@ -233,29 +266,69 @@ function frame(){
   if(keys['KeyD']){cam[0]+=B.r[0]*sp;cam[1]+=B.r[1]*sp;}
   if(keys['KeyA']){cam[0]-=B.r[0]*sp;cam[1]-=B.r[1]*sp;}
   if(keys['KeyE'])cam[2]+=sp;if(keys['KeyQ'])cam[2]-=sp;
-  if(!img){img=ctx.createImageData(CW,CH);zb=new Float32Array(CW*CH);}
-  const d=img.data,b0=BG[0],b1=BG[1],b2=BG[2];for(let i=0,p=0;i<CW*CH;i++,p+=4){d[p]=b0;d[p+1]=b1;d[p+2]=b2;d[p+3]=255;zb[i]=1e9;}
-  const fx=(W/2)/Math.tan(FOV/2)*(CW/W),cx=CW/2,cy=CH/2,r=B.r,dn=B.d,f=B.f,c0=cam[0],c1=cam[1],c2=cam[2];
-  for(let i=0;i<N;i++){const j=i*6;const x=CLOUD[j]-c0,y=CLOUD[j+1]-c1,z=CLOUD[j+2]-c2;
-    const zc=f[0]*x+f[1]*y+f[2]*z;if(zc<=0.05)continue;const iv=fx/zc;
-    const sx=(cx+(r[0]*x+r[1]*y+r[2]*z)*iv)|0,sy=(cy+(dn[0]*x+dn[1]*y+dn[2]*z)*iv)|0;
-    if(sx<0||sx>=CW||sy<0||sy>=CH)continue;const cr=CLOUD[j+3],cg=CLOUD[j+4],cb=CLOUD[j+5];
-    for(let dy=0;dy<PSIZE;dy++){const py=sy+dy;if(py>=CH)break;for(let dx=0;dx<PSIZE;dx++){const px=sx+dx;if(px>=CW)break;const k=py*CW+px;if(zc<zb[k]){zb[k]=zc;const o=k*4;d[o]=cr;d[o+1]=cg;d[o+2]=cb;}}}}
-  ctx.putImageData(img,0,0);
-  // chainEnd marker (green) + last facing direction arrow
+  if(window.GL&&GL.ready)GL.render(cam,B,FOV,CW,CH);
+  // ---- 2D overlay ----
+  octx.clearRect(0,0,CW,CH);
+  const fx=(W/2)/Math.tan(FOV/2)*(CW/W);
   const pe=proj(chainEnd.pos,B,fx);
   if(pe){
     const cbf=basis(chainEnd.yaw,chainEnd.pitch).f;
     const tip=proj([chainEnd.pos[0]+cbf[0]*0.6,chainEnd.pos[1]+cbf[1]*0.6,chainEnd.pos[2]+cbf[2]*0.6],B,fx);
-    if(tip){ctx.strokeStyle='#3f6';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(pe[0],pe[1]);ctx.lineTo(tip[0],tip[1]);ctx.stroke();
-      ctx.fillStyle='#3f6';ctx.beginPath();ctx.arc(tip[0],tip[1],5,0,7);ctx.fill();}
-    ctx.fillStyle='#3f6';ctx.beginPath();ctx.arc(pe[0],pe[1],7,0,7);ctx.fill();
-    ctx.font='11px sans';ctx.fillText('step start',pe[0]+9,pe[1]);
+    if(tip){octx.strokeStyle='#3f6';octx.lineWidth=3;octx.beginPath();octx.moveTo(pe[0],pe[1]);octx.lineTo(tip[0],tip[1]);octx.stroke();
+      octx.fillStyle='#3f6';octx.beginPath();octx.arc(tip[0],tip[1],5,0,7);octx.fill();}
+    octx.fillStyle='#3f6';octx.beginPath();octx.arc(pe[0],pe[1],7,0,7);octx.fill();
+    octx.font='11px sans';octx.fillText('step start',pe[0]+9,pe[1]);
   }
   document.getElementById('pos').textContent=`aim: ${cam[0].toFixed(2)}, ${cam[1].toFixed(2)}, ${cam[2].toFixed(2)}  yaw:${(yaw*180/Math.PI).toFixed(0)}°`;
   drawSel();
   requestAnimationFrame(frame);
 }
 async function pollLog(){try{const r=await api('/log');const el=document.getElementById('logpanel');el.textContent=r.log.slice(-16).join('\n');el.scrollTop=el.scrollHeight;}catch(e){}setTimeout(pollLog,1200);}
+addEventListener('glready',()=>{resize();GL.setBG(BG[0],BG[1],BG[2]);GL.setPointSize(PSIZE);if(scaffoldCloud.length)GL.setCloud(scaffoldCloud);});
 resize();addEventListener('resize',resize);refreshProjects();pollLog();requestAnimationFrame(frame);
+</script>
+<script type="importmap">{"imports":{"three":"/vendor/build/three.module.js","three/addons/":"/vendor/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+const cvEl=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas:cvEl,antialias:true});
+renderer.setPixelRatio(1); renderer.setClearColor(new THREE.Color(8/255,8/255,11/255),1);
+const scene=new THREE.Scene();
+const cam3=new THREE.PerspectiveCamera(60,1,0.03,500);
+cam3.matrixAutoUpdate=false; cam3.matrixWorldAutoUpdate=false;   // we feed view+proj matrices by hand
+scene.add(new THREE.HemisphereLight(0xffffff,0x202028,1.15));
+const dl=new THREE.DirectionalLight(0xffffff,1.25); dl.position.set(0.6,1,0.5); scene.add(dl);
+const loader=new GLTFLoader();
+let points=null, meshObj=null, ptSize=2;
+function setCloud(flat){
+  const n=flat.length/6, pos=new Float32Array(n*3), col=new Float32Array(n*3);
+  for(let i=0;i<n;i++){const j=i*6;pos[i*3]=flat[j];pos[i*3+1]=flat[j+1];pos[i*3+2]=flat[j+2];col[i*3]=flat[j+3]/255;col[i*3+1]=flat[j+4]/255;col[i*3+2]=flat[j+5]/255;}
+  if(points){scene.remove(points);points.geometry.dispose();points.material.dispose();}
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('color',new THREE.BufferAttribute(col,3));
+  points=new THREE.Points(g,new THREE.PointsMaterial({size:ptSize,vertexColors:true,sizeAttenuation:false}));
+  scene.add(points);
+}
+function loadMesh(url){loader.load(url+'?t='+Date.now(),gltf=>{if(meshObj)scene.remove(meshObj);meshObj=gltf.scene;meshObj.visible=true;scene.add(meshObj);},undefined,e=>console.warn('mesh load failed',e));}
+function clearMesh(){if(meshObj){scene.remove(meshObj);meshObj=null;}const c=document.getElementById('meshchk');if(c){c.disabled=true;c.checked=false;}}
+window.GL={ready:true,
+  setCloud, loadMesh, clearMesh,
+  setBG:(r,g,b)=>renderer.setClearColor(new THREE.Color(r/255,g/255,b/255),1),
+  setPointSize:px=>{ptSize=px;if(points)points.material.size=px;},
+  showMesh:b=>{if(meshObj)meshObj.visible=b;},
+  showCloud:b=>{if(points)points.visible=b;},
+  resize:(w,h)=>renderer.setSize(w,h,false),
+  render:(cam,B,fovRad,CW,CH)=>{
+    // view = world->eye (rows r,d,f) — IDENTICAL to proj()/w2cFrom on the client
+    const r=B.r,d=B.d,f=B.f,c=cam,fx=(CW/2)/Math.tan(fovRad/2);
+    const tr=-(r[0]*c[0]+r[1]*c[1]+r[2]*c[2]),td=-(d[0]*c[0]+d[1]*c[1]+d[2]*c[2]),tf=-(f[0]*c[0]+f[1]*c[1]+f[2]*c[2]);
+    cam3.matrixWorldInverse.set(r[0],r[1],r[2],tr, d[0],d[1],d[2],td, f[0],f[1],f[2],tf, 0,0,0,1);
+    cam3.matrixWorld.copy(cam3.matrixWorldInverse).invert();
+    // projection: ndc_x=2fx·(r·v)/(zc·CW), ndc_y=-2fx·(d·v)/(zc·CH)  (Y negated → image-space y-down)
+    const near=0.03,far=500,A=(far+near)/(far-near),Bz=-2*far*near/(far-near);
+    cam3.projectionMatrix.set(2*fx/CW,0,0,0, 0,-2*fx/CH,0,0, 0,0,A,Bz, 0,0,1,0);
+    cam3.projectionMatrixInverse.copy(cam3.projectionMatrix).invert();
+    renderer.render(scene,cam3);
+  }};
+window.dispatchEvent(new Event('glready'));
 </script></body></html>

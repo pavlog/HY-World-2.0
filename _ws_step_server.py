@@ -263,6 +263,25 @@ def index():
     return open(r"D:/HY-World-2.0/_ws_client.html", encoding="utf-8").read()
 
 
+@app.route('/vendor/<path:p>')
+def vendor(p):
+    """Serve three.js locally (same-origin → no CSP/CDN block) from the frontend node_modules."""
+    from flask import send_from_directory
+    return send_from_directory(r"E:/MyGame/AIWorldStudio/frontend/node_modules/three", p)
+
+
+@app.route('/pfile/<path:name>')
+def pfile(name):
+    """Serve a file from the current project dir (e.g. mesh.glb / fastmesh.glb) for the WebGL viewer (GLTFLoader)."""
+    if not S["proj"]:
+        return ('no project', 404)
+    from flask import send_file
+    fp = os.path.join(S["proj"], name)
+    if not os.path.exists(fp):
+        return ('not found', 404)
+    return send_file(fp)
+
+
 @app.route('/browse', methods=['GET', 'OPTIONS'])
 def browse():
     """Open a native Windows file dialog on the server machine (local tool) -> return the chosen path."""
@@ -273,7 +292,11 @@ def browse():
           "$f=New-Object System.Windows.Forms.OpenFileDialog;"
           "$f.Filter='Images|*.png;*.jpg;*.jpeg;*.webp;*.tif;*.tiff|All files|*.*';"
           "$f.Title='Select panorama (RGBA PNG = alpha mask)';"
-          "if($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($f.FileName)}")
+          # owner form forced TopMost so the dialog appears IN FRONT of the fullscreen browser
+          "$o=New-Object System.Windows.Forms.Form;"
+          "$o.TopMost=$true;$o.ShowInTaskbar=$false;$o.Opacity=0;$o.Show();$o.Activate();"
+          "$res=$f.ShowDialog($o);$o.Close();"
+          "if($res -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($f.FileName)}")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
                              capture_output=True, text=True, timeout=300)
@@ -548,14 +571,27 @@ def projects():
 def create_project():
     if request.method == 'OPTIONS':
         return ('', 204)
-    d = request.get_json()
-    name = d["name"].strip().strip('"').strip("'")
-    pano = d.get("pano", "D:/_world_hangar/panorama.png").strip().strip('"').strip("'")
-    if not os.path.exists(pano):
-        return jsonify({"error": f"pano not found: {pano}"}), 200
-    proj = f"{PROJ_ROOT}/{name}"; rr = f"{proj}/scene/render_results"
-    os.makedirs(f"{rr}/view0/traj0", exist_ok=True); os.makedirs(f"{proj}/frames", exist_ok=True)
-    shutil.copy(pano, f"{proj}/pano.png")
+    up = request.files.get('pano')                       # browser file-upload (multipart)
+    if up is not None:
+        name = (request.form.get('name') or '').strip().strip('"').strip("'")
+        if not name:
+            return jsonify({"error": "no project name"}), 200
+        proj = f"{PROJ_ROOT}/{name}"; rr = f"{proj}/scene/render_results"
+        os.makedirs(f"{rr}/view0/traj0", exist_ok=True); os.makedirs(f"{proj}/frames", exist_ok=True)
+        os.makedirs(f"{proj}/scene", exist_ok=True)
+        try:
+            Image.open(up.stream).save(f"{proj}/pano.png")   # normalize any format -> PNG (keeps alpha)
+        except Exception as e:
+            return jsonify({"error": f"bad image: {e}"}), 200
+    else:                                                # legacy: server-side path
+        d = request.get_json()
+        name = d["name"].strip().strip('"').strip("'")
+        pano = d.get("pano", "D:/_world_hangar/panorama.png").strip().strip('"').strip("'")
+        if not os.path.exists(pano):
+            return jsonify({"error": f"pano not found: {pano}"}), 200
+        proj = f"{PROJ_ROOT}/{name}"; rr = f"{proj}/scene/render_results"
+        os.makedirs(f"{rr}/view0/traj0", exist_ok=True); os.makedirs(f"{proj}/frames", exist_ok=True)
+        shutil.copy(pano, f"{proj}/pano.png")
     json.dump({"scene_type": "indoor"}, open(f"{proj}/scene/meta_info.json", "w"))
     PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()   # free GPU for MoGe
     build_scaffold(f"{proj}/pano.png", rr)
