@@ -963,7 +963,7 @@ def download_cameras():
     flip = np.diag([1.0, -1.0, -1.0, 1.0])   # OpenCV cam (+Z fwd,+Y down) -> Blender/OpenGL cam (-Z fwd,+Y up)
     K0 = np.array(S["history"][0]["intrinsic"], float)
     fovx = float(2 * np.arctan((832 / 2) / K0[0][0]) * 180 / np.pi)
-    frames = []; segments = []; gf = 0
+    frames = []; segments = []; waypoints = []; gf = 0
     for si, h in enumerate(S["history"]):
         mws = []
         for fi, w2c in enumerate(h["poses"]):
@@ -974,9 +974,12 @@ def download_cameras():
         segments.append({"step": si, "prompt": h.get("prompt", ""),          # one prompt per clip (= 6 poses)
                          "frame_start": gf - len(h["poses"]), "n_frames": len(h["poses"]),
                          "matrices_world": mws})
+        wc = np.array(h["poses"][-1], float); wmw = np.linalg.inv(wc) @ flip  # LAST pose = the position you clicked Generate Step at
+        waypoints.append({"step": si, "prompt": h.get("prompt", ""),
+                          "matrix_world": wmw.tolist(), "w2c": wc.tolist()})
     return jsonify({"convention": "matrix_world = inv(w2c) @ diag(1,-1,-1,1); set as Blender camera.matrix_world",
                     "fov_x_deg": fovx, "width": 832, "height": 480, "fps": 16,
-                    "segments": segments, "frames": frames})
+                    "waypoints": waypoints, "segments": segments, "frames": frames})
 
 
 @app.route('/download_pano', methods=['GET', 'OPTIONS'])

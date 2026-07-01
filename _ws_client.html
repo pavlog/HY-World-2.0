@@ -59,7 +59,7 @@
   <button id="compute" onclick="computeStep()">▶ Compute Step (6f)</button>
   <div><span id="status">no project</span></div>
   <div class="row"><button onclick="undo()">Undo</button><button onclick="resetChain()">Reset</button><span style="margin-left:auto">steps: <b id="stepcount">0</b></span></div>
-  <div class="row"><button onclick="downloadCameras()" title="Blender-ready camera path JSON">⬇ Camera path</button><button onclick="downloadPano()" title="Tweaked panorama as RGBA PNG (erased = transparent)">⬇ Pano (PNG)</button></div>
+  <div class="row"><button onclick="downloadWaypoints()" title="ONLY the points you clicked Generate Step at (1 per step) + prompt">⬇ Waypoints</button><button onclick="downloadCameras()" title="Full per-frame Blender camera path (6/step)">⬇ Full path</button><button onclick="downloadPano()" title="Tweaked panorama as RGBA PNG (erased = transparent)">⬇ Pano</button></div>
   <div class="row"><button onclick="downloadPanoMesh()" title="Download the current max-quality pano mesh (equirect grid, mesh.glb — generate it first)" style="width:100%">⬇ Download Pano Mesh (GLB)</button></div>
 </div>
 <div id="player" class="panel" style="top:10px;right:10px;width:300px;z-index:11">
@@ -161,6 +161,9 @@ function clearSel(){selBoxes=[];selBrushes=[];curBox=null;setStatus('selection c
 async function undoErase(){return undo();}
 async function downloadCameras(){const r=await api('/download_cameras');if(!r||!r.frames||!r.frames.length){setStatus('no camera path yet');return;}
   const blob=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='camera_path_blender.json';a.click();setStatus('downloaded '+r.frames.length+' cameras (Blender-ready)');}
+async function downloadWaypoints(){const r=await api('/download_cameras');if(!r||!r.waypoints||!r.waypoints.length){setStatus('no waypoints yet — generate a step first');return;}
+  const out={convention:r.convention,fov_x_deg:r.fov_x_deg,width:r.width,height:r.height,fps:r.fps,waypoints:r.waypoints};
+  const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='waypoints.json';a.click();setStatus('downloaded '+r.waypoints.length+' waypoints (clicked points only)');}
 function downloadPano(){const a=document.createElement('a');a.href='/download_pano';a.download='pano_tweaked.png';a.click();setStatus('downloading tweaked pano (RGBA)…');}
 // ---- Memory / eviction settings modal ----
 let _memTimer=null;
