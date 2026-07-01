@@ -963,14 +963,20 @@ def download_cameras():
     flip = np.diag([1.0, -1.0, -1.0, 1.0])   # OpenCV cam (+Z fwd,+Y down) -> Blender/OpenGL cam (-Z fwd,+Y up)
     K0 = np.array(S["history"][0]["intrinsic"], float)
     fovx = float(2 * np.arctan((832 / 2) / K0[0][0]) * 180 / np.pi)
-    frames = []
+    frames = []; segments = []; gf = 0
     for si, h in enumerate(S["history"]):
+        mws = []
         for fi, w2c in enumerate(h["poses"]):
             w2c = np.array(w2c, float); mw = np.linalg.inv(w2c) @ flip
-            frames.append({"step": si, "frame": fi, "prompt": h.get("prompt", ""),
+            frames.append({"step": si, "frame": fi, "global_frame": gf, "prompt": h.get("prompt", ""),
                            "matrix_world": mw.tolist(), "w2c": w2c.tolist()})
+            mws.append(mw.tolist()); gf += 1
+        segments.append({"step": si, "prompt": h.get("prompt", ""),          # one prompt per clip (= 6 poses)
+                         "frame_start": gf - len(h["poses"]), "n_frames": len(h["poses"]),
+                         "matrices_world": mws})
     return jsonify({"convention": "matrix_world = inv(w2c) @ diag(1,-1,-1,1); set as Blender camera.matrix_world",
-                    "fov_x_deg": fovx, "width": 832, "height": 480, "fps": 16, "frames": frames})
+                    "fov_x_deg": fovx, "width": 832, "height": 480, "fps": 16,
+                    "segments": segments, "frames": frames})
 
 
 @app.route('/download_pano', methods=['GET', 'OPTIONS'])
