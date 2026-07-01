@@ -14,7 +14,6 @@ Endpoints (all JSON):
 import sys, os, json, time, base64, shutil, gc, glob, threading, functools, hashlib
 import numpy as np, cv2, torch, trimesh
 sys.argv = [sys.argv[0]]
-import _ws_serve as WS
 sys.path.insert(0, r"D:/HY-World-2.0/hyworld2/worldgen")
 import utils3d
 import torch.nn.functional as F
@@ -25,8 +24,34 @@ from diffusers.utils import export_to_video
 from PIL import Image
 from flask import Flask, request, jsonify
 
-dev, MODEL, PIPE, cfg = WS.device, WS.MODEL_TYPE, WS.PIPE, WS.ws.cfg
-NEG = cfg.get("negative_prompt", "")
+# ---- LAZY model loading -------------------------------------------------------
+#   The WorldStereo pipeline (17B + aux, ~1-3 min cold) is NOT loaded at startup.
+#   The server comes up in ~2s for ALL authoring (upload/scaffold/mesh/erase/nav —
+#   these need only MoGe, loaded per-call). The gen pipeline loads on the first
+#   /step (or when you press Reload in the settings modal).
+dev = torch.device("cuda:0")
+WS = None; PIPE = None; cfg = None; MODEL = None; NEG = ""
+WS_LOADED = {"v": False}
+_WS_LOCK = threading.Lock()
+
+def _ensure_ws():
+    """Import + build the WorldStereo pipeline on first use. Idempotent, thread-safe."""
+    global WS, PIPE, cfg, MODEL, NEG
+    if WS_LOADED["v"]:
+        return
+    with _WS_LOCK:
+        if WS_LOADED["v"]:
+            return
+        t0 = time.time(); logln("loading WorldStereo pipeline (first use, ~1-3 min)…")
+        import _ws_serve as _WSmod
+        WS = _WSmod
+        PIPE = WS.PIPE; cfg = WS.ws.cfg; MODEL = WS.MODEL_TYPE; NEG = cfg.get("negative_prompt", "")
+        PIPE.image_encoder.to("cpu")
+        PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()
+        GPU["loaded"] = True; GPU["cpu_unloaded"] = False; GPU["last"] = time.time()
+        WS_LOADED["v"] = True
+        logln(f"WorldStereo pipeline ready in {time.time()-t0:.0f}s.")
+
 PROJ_ROOT = r"D:/_world_hangar/_ws_projects"; os.makedirs(PROJ_ROOT, exist_ok=True)
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 PE_CACHE = {}
@@ -38,20 +63,95 @@ S = {"proj": None, "pano": None, "gpts": None, "gcol": None, "last_png": None, "
      # incremental, undo-aware coverage accumulation (scaffold points stay at indices [0:scaffold_n]):
      "scaffold_n": 0, "step_pts": [], "accum_step": 0, "scale": None}
 
-# transformer RESIDENT on GPU, CLIP parked (the proven 24GB recipe — NOT run_one which spills CLIP+umt5)
-PIPE.image_encoder.to("cpu")
-PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()
+# (WorldStereo transformer/CLIP residency is set up lazily in _ensure_ws — see top of file)
 
-# ---- idle GPU auto-eviction: after IDLE_SECONDS with no GPU request, park transformer+VAE on CPU + empty_cache
-#      (frees VRAM for other tasks). Next GPU request lazily restores. Uses the same .to() moves /step already does.
-IDLE_SECONDS = 60
-GPU = {"loaded": True, "busy": 0, "last": time.time()}
+# ---- two-stage idle eviction -------------------------------------------------
+#   stage 1 (IDLE_GPU): park transformer+VAE on CPU -> frees VRAM (fast resume).
+#   stage 2 (IDLE_CPU): meta-free the transformer from CPU RAM (~17.5GB); its fp8
+#     weights stay on disk and are reloaded lazily on the next generation (/step).
+#   Both timeouts are live-editable from the client Settings modal (/settings).
+IDLE_GPU = 60
+IDLE_CPU = 300
+_FP8_FILE = os.environ.get("WS_FP8_FILE")
+GPU = {"loaded": False, "busy": 0, "last": time.time(), "cpu_unloaded": False}   # loaded=False until WS is lazily built
 GPU_LOCK = threading.Lock()
+
+def _reload_transformer():
+    """Re-materialize the fp8 transformer from its on-disk file into the (meta) module
+    — mirrors the startup fp8 loader in worldstereo_wrapper._load_transformer."""
+    from safetensors import safe_open as _so
+    import torch.nn as _nn
+    t0 = time.time()
+    def _owner(root, key):
+        *pth, a = key.split("."); m = root
+        for p in pth:
+            m = getattr(m, p)
+        return m, a
+    with _so(_FP8_FILE, framework="pt", device="cpu") as f:
+        for k in f.keys():
+            try:
+                m, a = _owner(PIPE.transformer, k); t = f.get_tensor(k)   # preserve fp8 dtype
+                if a in m._parameters:
+                    m._parameters[a] = _nn.Parameter(t, requires_grad=False)
+                elif a in m._buffers:
+                    m._buffers[a] = t
+                else:
+                    setattr(m, a, t)
+            except Exception:
+                pass
+    for name, p in list(PIPE.transformer.named_parameters()) + list(PIPE.transformer.named_buffers()):
+        if p.is_meta:                                                     # params not in the file -> zeros
+            m, a = _owner(PIPE.transformer, name); z = torch.zeros(p.shape, dtype=torch.bfloat16)
+            if a in m._parameters:
+                m._parameters[a] = _nn.Parameter(z, requires_grad=False)
+            else:
+                m._buffers[a] = z
+    logln(f"transformer reloaded from fp8 file in {time.time()-t0:.1f}s")
+
+def _unload_transformer_cpu():
+    if PIPE is None or GPU["cpu_unloaded"]:
+        return
+    if not _FP8_FILE:
+        logln("cpu-unload skipped: WS_FP8_FILE not set (cannot reload)"); return
+    PIPE.transformer.to("meta"); WS._STATE["tr_on_gpu"] = False           # drops the ~17.5GB CPU storage
+    GPU["cpu_unloaded"] = True; gc.collect(); torch.cuda.empty_cache()
+    _trim_working_set()                                                   # force the freed pages back to the OS
+    logln("transformer UNLOADED from CPU RAM (~17.5GB freed; weights on disk)")
+
+
+def _trim_working_set():
+    """Windows: freed torch CPU tensors sit in the malloc arena (RSS stays high). EmptyWorkingSet
+    trims the process working set so those pages are returned to the OS for other tasks."""
+    try:
+        import ctypes
+        ctypes.windll.psapi.EmptyWorkingSet(ctypes.c_void_p(-1))          # -1 = GetCurrentProcess()
+    except Exception as e:
+        logln(f"working-set trim skipped: {e}")
+
+def _ensure_transformer():
+    """Gen path guard: if the transformer was meta-freed, reload it before use."""
+    if PIPE is None:
+        return
+    if GPU["cpu_unloaded"]:
+        logln("transformer needed → reloading from disk…")
+        _reload_transformer(); GPU["cpu_unloaded"] = False
+
+def _park_transformer_cpu():
+    """Move transformer off GPU to CPU (VRAM headroom for MoGe). No-op if unloaded / not built yet."""
+    if PIPE is None or GPU["cpu_unloaded"]:
+        return
+    PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()
+
+def _restore_transformer_gpu():
+    """Make the transformer resident on GPU again after a MoGe op — unless unloaded / not built yet."""
+    if PIPE is None or GPU["cpu_unloaded"]:
+        return                                                            # stay light; /step reloads on demand
+    PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()
 
 def _gpu_ensure():
     with GPU_LOCK:
         GPU["busy"] += 1; GPU["last"] = time.time()
-        if not GPU["loaded"]:
+        if not GPU["loaded"] and PIPE is not None:
             PIPE.vae.to(dev)                       # transformer is restored by the gen path (tr_on_gpu flag)
             GPU["loaded"] = True; logln("GPU: resumed (VAE back on GPU)")
 
@@ -71,18 +171,46 @@ def gpu_endpoint(fn):
             _gpu_done()
     return w
 
+def _mem_status():
+    free = tot = 0
+    try:
+        free, tot = torch.cuda.mem_get_info()
+    except Exception:
+        pass
+    ram = None
+    try:
+        import psutil; ram = round(psutil.Process().memory_info().rss / 1073741824, 2)
+    except Exception:
+        pass
+    return {"idle_gpu": IDLE_GPU, "idle_cpu": IDLE_CPU, "model_loaded": WS_LOADED["v"],
+            "gpu_loaded": GPU["loaded"], "cpu_unloaded": GPU["cpu_unloaded"],
+            "tr_on_gpu": bool(WS._STATE.get("tr_on_gpu", False)) if WS is not None else False,
+            "idle_s": int(time.time() - GPU["last"]), "busy": GPU["busy"],
+            "vram_used_mb": round((tot - free) / 1048576) if tot else None,
+            "vram_total_mb": round(tot / 1048576) if tot else None,
+            "ram_gb": ram}
+
 def _gpu_watchdog():
     while True:
         time.sleep(5)
         with GPU_LOCK:
-            if GPU["loaded"] and GPU["busy"] == 0 and (time.time() - GPU["last"]) > IDLE_SECONDS:
+            if PIPE is None or GPU["busy"] != 0:      # nothing loaded yet → nothing to evict
+                continue
+            idle = time.time() - GPU["last"]
+            if GPU["loaded"] and idle > IDLE_GPU:                          # stage 1: free VRAM
                 try:
-                    PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False
+                    if not GPU["cpu_unloaded"]:
+                        PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False
                     PIPE.vae.to("cpu"); torch.cuda.empty_cache()
                     GPU["loaded"] = False
-                    logln(f"GPU idle {IDLE_SECONDS}s -> parked transformer+VAE on CPU (VRAM freed)")
+                    logln(f"GPU idle {int(idle)}s > {IDLE_GPU}s → parked on CPU (VRAM freed)")
                 except Exception as e:
                     logln(f"GPU evict error: {e}")
+            if (not GPU["loaded"]) and (not GPU["cpu_unloaded"]) and idle > IDLE_CPU:   # stage 2: free RAM
+                try:
+                    _unload_transformer_cpu()
+                except Exception as e:
+                    logln(f"CPU unload error: {e}")
 threading.Thread(target=_gpu_watchdog, daemon=True).start()
 
 
@@ -120,6 +248,8 @@ def encode_prompt_cached(prompt):
 
 
 def gen_clip(rr, prompt, ref_index):
+    _ensure_ws()                                # lazily build the WorldStereo pipeline on first generation
+    _ensure_transformer()                       # reload from disk if it was meta-freed on idle
     pe, ne = encode_prompt_cached(prompt)
     meta = load_mutli_traj_dataset(cfg=cfg, input_path=rr, output_path=rr, view_id="view0", traj_id="traj0",
                                    device=dev, ref_index=ref_index, model_type=MODEL, task_type="panorama")
@@ -152,7 +282,7 @@ def build_scaffold(pano_path, rr):
     W0, H0 = full_img.size
     logln("MoGe-2: loading + predicting panorama depth…")
     from moge.model.v2 import MoGeModel
-    moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval()
+    moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval(); gc.collect()   # drop the CPU staging copy right away
     fd = pred_pano_depth(moge, full_img)
     logln("unprojecting to global point cloud…")
     fd["distance"] = fd["distance"].to(dev); fd["rays"] = fd["rays"].to(dev)
@@ -310,6 +440,67 @@ def getlog():
     return jsonify({"log": list(LOG)})
 
 
+@app.route('/settings', methods=['GET', 'POST', 'OPTIONS'])
+def settings():
+    """GET current memory settings/status; POST {idle_gpu, idle_cpu} to change the eviction timeouts."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    global IDLE_GPU, IDLE_CPU
+    if request.method == 'POST':
+        d = request.get_json(silent=True) or {}
+        if 'idle_gpu' in d and d['idle_gpu'] is not None:
+            IDLE_GPU = max(5, int(d['idle_gpu']))
+        if 'idle_cpu' in d and d['idle_cpu'] is not None:
+            IDLE_CPU = max(IDLE_GPU, int(d['idle_cpu']))
+        logln(f"settings: IDLE_GPU={IDLE_GPU}s  IDLE_CPU={IDLE_CPU}s")
+    return jsonify(_mem_status())
+
+
+@app.route('/force_gpu_evict', methods=['POST', 'OPTIONS'])
+def force_gpu_evict():
+    """Park transformer+VAE on CPU now (free VRAM)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    with GPU_LOCK:
+        if GPU["busy"]:
+            return jsonify({**_mem_status(), "skipped": "busy"})
+        if GPU["loaded"]:
+            if not GPU["cpu_unloaded"]:
+                PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False
+            PIPE.vae.to("cpu"); torch.cuda.empty_cache(); GPU["loaded"] = False
+            logln("force: parked on CPU (VRAM freed)")
+    return jsonify(_mem_status())
+
+
+@app.route('/force_cpu_unload', methods=['POST', 'OPTIONS'])
+def force_cpu_unload():
+    """Fully unload the transformer from CPU RAM now (~17.5GB); reloads on next /step."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    with GPU_LOCK:
+        if GPU["busy"]:
+            return jsonify({**_mem_status(), "skipped": "busy"})
+        if GPU["loaded"]:
+            PIPE.vae.to("cpu"); torch.cuda.empty_cache(); GPU["loaded"] = False
+        _unload_transformer_cpu()
+    return jsonify(_mem_status())
+
+
+@app.route('/force_reload', methods=['POST', 'OPTIONS'])
+def force_reload():
+    """Reload the transformer into RAM now (undo a cpu-unload without generating)."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not WS_LOADED["v"]:
+        _ensure_ws()                                     # build the pipeline (minutes) outside the GPU lock
+    else:
+        with GPU_LOCK:
+            if GPU["busy"]:
+                return jsonify({**_mem_status(), "skipped": "busy"})
+            _ensure_transformer(); GPU["last"] = time.time()
+    return jsonify(_mem_status())
+
+
 @app.route('/frames', methods=['POST', 'OPTIONS'])
 def frames_all():
     if request.method == 'OPTIONS':
@@ -340,12 +531,12 @@ def mesh():
     diag = float(np.linalg.norm(V.max(0) - V.min(0)))
     if len(V) > 1_500_000:
         pcd = pcd.voxel_down_sample(diag * 0.004)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.5)
     logln("meshing: normals + Poisson…")
     pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=diag * 0.02, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(15)
     m, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=10, linear_fit=True)
-    dens = np.asarray(dens); m.remove_vertices_by_mask(dens < np.quantile(dens, 0.04))
+    dens = np.asarray(dens); m.remove_vertices_by_mask(dens < np.quantile(dens, 0.02))
     m.remove_degenerate_triangles(); m.remove_unreferenced_vertices(); m.compute_vertex_normals()
     out = f"{S['proj']}/mesh"
     o3d.io.write_triangle_mesh(out + ".ply", m)
@@ -365,13 +556,68 @@ def mesh():
     return jsonify({"verts": flat.tolist(), "normals": nf.tolist(), "nverts": int(len(MV)), "ntris": int(len(Fc)), "glb": out + ".glb"})
 
 
+@app.route('/pano_mesh', methods=['POST', 'OPTIONS'])
+def pano_mesh():
+    """MAX-quality single-pano VIEWING mesh: an equirect GRID mesh straight from the scaffold
+    depth (one vertex per pano pixel, faces on the grid with horizontal wrap, cut at depth
+    discontinuities + excluded/erased regions). No Poisson → no balloon, no spurious holes.
+    Body: {rel: depth-continuity threshold (0.1), downscale: 1=full res}."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    if not S["proj"]:
+        return jsonify({"error": "no project open"}), 200
+    d = request.get_json(silent=True) or {}
+    rel = float(d.get("rel", 0.1)); ds = max(1, int(d.get("downscale", 1)))
+    dp = f"{S['proj']}/scene/render_results/full_depth_prediction.pt"
+    if not os.path.exists(dp):
+        return jsonify({"error": "no depth prediction — recreate the project"}), 200
+    logln(f"pano-mesh: equirect grid mesh (rel={rel}, downscale={ds})…")
+    fd = torch.load(dp, map_location="cpu")
+    dist = fd["distance"].float(); rays = fd["rays"].float()            # (H,W), (H,W,3)
+    H, W = dist.shape
+    pim = Image.open(f"{S['proj']}/pano.png").convert("RGB").resize((W, H), Image.BICUBIC)
+    col = np.asarray(pim, np.float32) / 255.0
+    excl = np.zeros((H, W), bool)                                       # regions to leave as holes
+    a = np.asarray(Image.open(f"{S['proj']}/pano.png").convert("RGBA"))[..., 3]
+    if (a < 250).any():
+        excl |= np.asarray(Image.fromarray(a).resize((W, H), Image.NEAREST)) < 128
+    pmp = f"{S['proj']}/pano_mask.png"
+    if os.path.exists(pmp):
+        excl |= np.asarray(Image.open(pmp).convert("L").resize((W, H), Image.NEAREST)) < 128
+    if ds > 1:
+        dist = dist[::ds, ::ds].contiguous(); rays = rays[::ds, ::ds].contiguous()
+        col = col[::ds, ::ds]; excl = excl[::ds, ::ds]; H, W = dist.shape
+    verts = (dist.unsqueeze(-1) * rays).reshape(-1, 3).numpy()
+    cols = (np.clip(col.reshape(-1, 3), 0, 1) * 255).astype(np.uint8)
+    dnp = dist.numpy()
+    ii, jj = np.meshgrid(np.arange(H - 1), np.arange(W), indexing='ij'); j1 = (jj + 1) % W
+    v00 = ii * W + jj; v01 = ii * W + j1; v10 = (ii + 1) * W + jj; v11 = (ii + 1) * W + j1
+    d00 = dnp[ii, jj]; d01 = dnp[ii, j1]; d10 = dnp[ii + 1, jj]; d11 = dnp[ii + 1, j1]
+    dmax = np.maximum(np.maximum(d00, d01), np.maximum(d10, d11))
+    dmin = np.minimum(np.minimum(d00, d01), np.minimum(d10, d11))
+    cont = (dmax - dmin) <= rel * np.maximum(dmin, 1e-3)                # cut across depth jumps
+    unmasked = ~(excl[ii, jj] | excl[ii, j1] | excl[ii + 1, jj] | excl[ii + 1, j1])
+    valid = cont & unmasked & (dmin > 1e-3)
+    tri1 = np.stack([v00, v10, v11], -1)[valid]; tri2 = np.stack([v00, v11, v01], -1)[valid]
+    faces = np.concatenate([tri1, tri2], 0)
+    if len(faces) == 0:
+        return jsonify({"error": "no faces (all cut) — raise rel"}), 200
+    VC = np.concatenate([cols, np.full((len(cols), 1), 255, np.uint8)], 1)
+    m = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=VC, process=False)
+    m.remove_unreferenced_vertices()
+    out = f"{S['proj']}/mesh"
+    m.export(out + ".glb")
+    logln(f"pano-mesh DONE: {len(m.vertices)} verts, {len(m.faces)} tris → mesh.glb")
+    return jsonify({"nverts": int(len(m.vertices)), "ntris": int(len(m.faces)), "glb": out + ".glb"})
+
+
 def _mesh_payload(pcd, outname, voxel, depth=10, fast=False):
     import open3d as o3d
     pts = np.asarray(pcd.points)
     diag = float(np.linalg.norm(pts.max(0) - pts.min(0)))
     if voxel and voxel > 0:
         pcd = pcd.voxel_down_sample(voxel)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=(8 if fast else 20), std_ratio=2.0)
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=(8 if fast else 20), std_ratio=2.5)
     logln(f"normals + Poisson (depth={depth}{', fast' if fast else ''})…")
     pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=diag * 0.02, max_nn=(16 if fast else 30)))
     if fast:
@@ -379,7 +625,7 @@ def _mesh_payload(pcd, outname, voxel, depth=10, fast=False):
     else:
         pcd.orient_normals_consistent_tangent_plane(15)                         # slow but globally consistent
     m, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, linear_fit=(not fast))
-    dens = np.asarray(dens); m.remove_vertices_by_mask(dens < np.quantile(dens, 0.04))
+    dens = np.asarray(dens); m.remove_vertices_by_mask(dens < np.quantile(dens, 0.02))
     m.remove_degenerate_triangles(); m.remove_unreferenced_vertices(); m.compute_vertex_normals()
     o3d.io.write_triangle_mesh(outname + ".ply", m)
     MV = np.asarray(m.vertices); Fc = np.asarray(m.triangles)
@@ -433,8 +679,8 @@ def accumulate():
     if start < end:
         _snapshot()                                       # unified undo: snapshot before accumulating new steps
         logln(f"accumulate: steps {start}..{end-1} (freeing GPU + MoGe)…")
-        PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()
-        moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval()
+        _park_transformer_cpu()
+        moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval(); gc.collect()
         if S["scale"] is None:                          # global MoGe<->scaffold scale, once (step0 frame0)
             h0 = S["history"][0]; K0 = np.array(h0["intrinsic"], np.float32); pose0 = np.array(h0["poses"][0], np.float32)
             fr0 = cv2.cvtColor(cv2.imread(f"{FR}/s000_f0.png"), cv2.COLOR_BGR2RGB); H, W = fr0.shape[:2]
@@ -474,7 +720,7 @@ def accumulate():
                 S["step_pts"].append(0)
             S["accum_step"] = si + 1
         del moge; gc.collect(); torch.cuda.empty_cache()
-        PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True
+        _restore_transformer_gpu()
         _accum_save()
         logln(f"accumulate DONE: {S['accum_step']} steps, {sum(S['step_pts'])} accumulated pts")
     # fast Poisson preview over scaffold + all accumulated coverage
@@ -497,8 +743,8 @@ def world_mesh():
     from moge.model.v2 import MoGeModel
     FR = f"{S['proj']}/frames"
     logln("world-mesh: freeing GPU + loading MoGe-2…")
-    PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()
-    moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval()
+    _park_transformer_cpu()
+    moge = MoGeModel.from_pretrained(MOGE_ID).to(dev).eval(); gc.collect()
 
     # global scale: MoGe depth vs scaffold-rendered depth on step0 frame0
     h0 = S["history"][0]; K0 = np.array(h0["intrinsic"], np.float32); pose0 = np.array(h0["poses"][0], np.float32)
@@ -531,14 +777,14 @@ def world_mesh():
             world = (np.concatenate([pc, np.ones((len(pc), 1))], 1) @ c2w.T)[:, :3].astype(np.float32)
             pts_all.append(world); col_all.append(fr.reshape(-1, 3)[m])
     del moge; gc.collect(); torch.cuda.empty_cache()
-    PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True
+    _restore_transformer_gpu()
     if not pts_all:
         return jsonify({"error": "no valid geometry"}), 200
     P = np.concatenate(pts_all).astype(np.float64); C = np.concatenate(col_all).astype(np.float64) / 255.0
     logln(f"world-mesh: {len(P)} fused pts → mesh…")
     pcd = o3d.geometry.PointCloud(); pcd.points = o3d.utility.Vector3dVector(P); pcd.colors = o3d.utility.Vector3dVector(np.clip(C, 0, 1))
     diag = float(np.linalg.norm(P.max(0) - P.min(0)))
-    return jsonify(_mesh_payload(pcd, f"{S['proj']}/world_mesh", max(0.005, diag * 0.003)))
+    return jsonify(_mesh_payload(pcd, f"{S['proj']}/world_mesh", max(0.0025, diag * 0.0015), depth=11))
 
 
 @app.route('/cloud', methods=['POST', 'OPTIONS'])
@@ -593,9 +839,9 @@ def create_project():
         os.makedirs(f"{rr}/view0/traj0", exist_ok=True); os.makedirs(f"{proj}/frames", exist_ok=True)
         shutil.copy(pano, f"{proj}/pano.png")
     json.dump({"scene_type": "indoor"}, open(f"{proj}/scene/meta_info.json", "w"))
-    PIPE.transformer.to("cpu"); WS._STATE["tr_on_gpu"] = False; torch.cuda.empty_cache()   # free GPU for MoGe
+    _park_transformer_cpu()                                                                # free GPU for MoGe
     build_scaffold(f"{proj}/pano.png", rr)
-    PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()       # transformer resident again
+    _restore_transformer_gpu()                                                             # resident again (unless unloaded)
     set_current(name)
     return jsonify(cloud_payload())
 
@@ -606,6 +852,28 @@ def open_project():
         return ('', 204)
     set_current(request.get_json()["name"])
     return jsonify(cloud_payload())
+
+
+@app.route('/delete_project', methods=['POST', 'OPTIONS'])
+def delete_project():
+    """Permanently delete a project directory. If it's the current one, clear in-memory state."""
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    name = (request.get_json(silent=True) or {}).get("name", "").strip().strip('"').strip("'")
+    if not name:
+        return jsonify({"error": "no name"}), 200
+    proj = f"{PROJ_ROOT}/{name}"
+    if not os.path.isdir(proj):
+        return jsonify({"error": "not found"}), 200
+    was_current = bool(S["proj"]) and os.path.basename(S["proj"]) == name
+    if was_current:
+        S.update({"proj": None, "pano": None, "gpts": None, "gcol": None, "last_png": None,
+                  "last_result": None, "step": 0, "history": [], "scaffold_n": 0,
+                  "step_pts": [], "accum_step": 0, "scale": None})
+        OPS.clear()
+    shutil.rmtree(proj, ignore_errors=True)
+    logln(f"deleted project: {name}")
+    return jsonify({"ok": True, "was_current": was_current})
 
 
 @app.route('/reset', methods=['POST', 'OPTIONS'])

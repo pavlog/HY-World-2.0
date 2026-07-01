@@ -28,8 +28,9 @@
 <canvas id="c"></canvas>
 <canvas id="ov"></canvas>
 <div id="ui" class="panel">
-  <h3>WorldStereo Step Tool <span style="font-size:10px;color:#9af;font-weight:400">· WebGL</span></h3>
-  <div class="row"><select id="projsel"></select><button onclick="openProj()">Open</button></div>
+  <h3>WorldStereo Step Tool <span style="font-size:10px;color:#9af;font-weight:400">· WebGL</span>
+    <button onclick="openSettings()" title="Memory / eviction settings" style="float:right;padding:1px 7px">⚙</button></h3>
+  <div class="row"><select id="projsel"></select><button onclick="openProj()">Open</button><button onclick="deleteProj()" title="Delete selected project (permanent)" style="color:#f88">🗑</button></div>
   <div class="row"><button onclick="openNewModal()" style="width:100%">+ New project…</button></div>
   <hr>
   <div>Click scene → <b>WASD</b>/<b>QE</b> move, drag-look. Position the camera = where this step ENDS.</div>
@@ -47,16 +48,19 @@
     <div><button onclick="pushErase()" style="background:#a33;color:#fff;font-weight:600">▣ Push delete</button><button onclick="clearSel()">Clear</button><button onclick="undoErase()">Undo del</button></div>
   </div>
   <div>points: <select id="ptcount" onchange="reloadCloud()" style="width:auto"><option value="100000">100k</option><option value="300000" selected>300k</option><option value="500000">500k</option><option value="1000000">1M</option><option value="all">All (1.8M)</option></select></div>
-  <div><button onclick="genMesh('/mesh','meshing pano')" style="width:100%">⬢ Generate Pano Mesh</button></div>
+  <div><button onclick="genMesh('/pano_mesh','building max-quality pano mesh')" style="width:100%">⬢ Generate Pano Mesh (max quality)</button></div>
   <div><button onclick="genMesh('/world_mesh','meshing world (MoGe, ~1min)')" style="width:100%">⬢ Generate World Mesh (from gen)</button></div>
   <div><button onclick="genMesh('/accumulate','updating coverage (MoGe new steps + fast Poisson)')" style="width:100%">⬢ Refresh Coverage (fast preview)</button></div>
-  <div style="font-size:12px"><label><input type="checkbox" id="meshchk" disabled onchange="toggleMesh(this)"> show mesh (solid)</label> <label style="margin-left:6px"><input type="checkbox" id="cloudchk" checked onchange="if(window.GL)GL.showCloud(this.checked)"> show cloud</label></div>
+  <div style="font-size:12px"><label><input type="checkbox" id="meshchk" disabled onchange="toggleMesh(this)"> show mesh (solid)</label> <label style="margin-left:6px"><input type="checkbox" id="cloudchk" checked onchange="if(window.GL)GL.showCloud(this.checked)"> show cloud</label>
+    <button id="dlmeshbtn" onclick="downloadShownMesh()" disabled title="Download the generated mesh GLB shown in the viewer" style="padding:2px 8px;margin-left:6px">⬇ GLB</button>
+    <label style="margin-left:6px" title="100% flat ambient — no directional shading, pure vertex colors"><input type="checkbox" id="ambchk" onchange="if(window.GL)GL.setAmbientOnly(this.checked)"> ambient only</label></div>
+  <div class="row" style="align-items:center;font-size:12px"><span>ambient</span><input type="range" id="ambrange" min="0" max="2" step="0.05" value="0.7" style="flex:1" oninput="if(window.GL)GL.setAmbient(this.value);document.getElementById('ambval').textContent=(+this.value).toFixed(2)"><span id="ambval">0.70</span></div>
   <textarea id="prompt">sci-fi spaceship hangar interior, cinematic, high detail</textarea>
   <button id="compute" onclick="computeStep()">▶ Compute Step (6f)</button>
   <div><span id="status">no project</span></div>
   <div class="row"><button onclick="undo()">Undo</button><button onclick="resetChain()">Reset</button><span style="margin-left:auto">steps: <b id="stepcount">0</b></span></div>
   <div class="row"><button onclick="downloadCameras()" title="Blender-ready camera path JSON">⬇ Camera path</button><button onclick="downloadPano()" title="Tweaked panorama as RGBA PNG (erased = transparent)">⬇ Pano (PNG)</button></div>
-  <div class="row"><button onclick="downloadMesh()" title="High-quality pano mesh GLB (Poisson depth-10; generated from current cloud)" style="width:100%">⬇ Pano Mesh — HQ GLB</button></div>
+  <div class="row"><button onclick="downloadPanoMesh()" title="Download the current max-quality pano mesh (equirect grid, mesh.glb — generate it first)" style="width:100%">⬇ Download Pano Mesh (GLB)</button></div>
 </div>
 <div id="player" class="panel" style="top:10px;right:10px;width:300px;z-index:11">
   <img id="pimg" style="width:100%;border-radius:5px;display:block;background:#000;border:2px solid #ff9a3c">
@@ -86,6 +90,24 @@
       <button onclick="closeNewModal()">Cancel</button>
     </div>
     <div id="newstatus" style="font-size:11px;color:#7fd;margin-top:6px;min-height:14px"></div>
+  </div>
+</div>
+<div id="setmodal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:50;align-items:center;justify-content:center">
+  <div class="panel" style="position:relative;width:400px;max-width:92vw">
+    <h3 style="margin:0 0 8px;color:#ff9a3c;font-size:15px">Memory settings</h3>
+    <div id="memstat" style="font-size:12px;line-height:1.6;background:#14141a;border-radius:6px;padding:8px;margin-bottom:10px">…</div>
+    <div class="row" style="align-items:center"><span style="flex:1">GPU idle → park to CPU (sec)</span><input id="idlegpu" type="number" min="5" style="width:90px"></div>
+    <div class="row" style="align-items:center"><span style="flex:1">CPU idle → unload RAM (sec)</span><input id="idlecpu" type="number" min="5" style="width:90px"></div>
+    <div style="font-size:11px;opacity:.55;margin:2px 0 10px">Authoring (mesh/erase/nav) needs no gen-model. After CPU-unload the first clip reloads it (~30–90s).</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+      <button onclick="forceMem('/force_gpu_evict')" title="Park model on CPU, free VRAM">Free GPU now</button>
+      <button onclick="forceMem('/force_cpu_unload')" title="Unload transformer from RAM (~17.5GB)">Unload RAM now</button>
+      <button onclick="forceMem('/force_reload')" title="Reload model into RAM">Reload now</button>
+    </div>
+    <div style="display:flex;gap:6px">
+      <button onclick="saveSettings()" style="flex:1;background:#ff9a3c;color:#111;font-weight:600;padding:8px">Save</button>
+      <button onclick="closeSettings()">Close</button>
+    </div>
   </div>
 </div>
 <script>
@@ -140,6 +162,34 @@ async function undoErase(){return undo();}
 async function downloadCameras(){const r=await api('/download_cameras');if(!r||!r.frames||!r.frames.length){setStatus('no camera path yet');return;}
   const blob=new Blob([JSON.stringify(r,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='camera_path_blender.json';a.click();setStatus('downloaded '+r.frames.length+' cameras (Blender-ready)');}
 function downloadPano(){const a=document.createElement('a');a.href='/download_pano';a.download='pano_tweaked.png';a.click();setStatus('downloading tweaked pano (RGBA)…');}
+// ---- Memory / eviction settings modal ----
+let _memTimer=null;
+function _renderMem(s){const b=v=>v?'<span style="color:#7f7">yes</span>':'<span style="color:#f88">no</span>';
+  document.getElementById('memstat').innerHTML=
+    'model: '+(s.model_loaded?'<span style="color:#7f7">loaded</span>':'<span style="color:#fb7">not loaded (loads on first generation)</span>')+'<br>'+
+    'RAM: <b>'+(s.ram_gb!=null?s.ram_gb+' GB':'?')+'</b> &nbsp; VRAM: <b>'+(s.vram_used_mb!=null?s.vram_used_mb+' / '+s.vram_total_mb+' MB':'?')+'</b><br>'+
+    'on GPU: '+b(s.tr_on_gpu)+' &nbsp; parked→CPU: '+b(!s.gpu_loaded&&!s.cpu_unloaded&&s.model_loaded)+' &nbsp; RAM-freed: '+b(s.cpu_unloaded)+'<br>'+
+    'idle: '+s.idle_s+'s &nbsp; busy: '+s.busy;}
+async function openSettings(){document.getElementById('setmodal').style.display='flex';   // show first (so it opens even if the fetch fails)
+  document.getElementById('memstat').textContent='loading status…';
+  try{const s=await api('/settings');document.getElementById('idlegpu').value=s.idle_gpu;document.getElementById('idlecpu').value=s.idle_cpu;_renderMem(s);}
+  catch(e){document.getElementById('memstat').textContent='status unavailable (server not responding): '+e;}
+  clearInterval(_memTimer);_memTimer=setInterval(async()=>{try{_renderMem(await api('/settings'))}catch(e){}},2000);}
+function closeSettings(){document.getElementById('setmodal').style.display='none';clearInterval(_memTimer);}
+async function saveSettings(){const idle_gpu=+document.getElementById('idlegpu').value,idle_cpu=+document.getElementById('idlecpu').value;
+  const s=await api('/settings',{idle_gpu,idle_cpu});_renderMem(s);setStatus('memory timeouts: GPU '+s.idle_gpu+'s / CPU '+s.idle_cpu+'s');}
+async function forceMem(ep){setStatus('memory: '+ep+'…');try{const s=await api(ep,{});_renderMem(s);
+  setStatus(s.skipped?('memory op skipped ('+s.skipped+')'):'memory: '+ep+' done');}catch(e){setStatus('mem op failed: '+e);}}
+async function downloadPanoMesh(){
+  try{const r=await fetch('/pfile/mesh.glb?t='+Date.now());
+    if(!r.ok){setStatus('no pano mesh yet — press “Generate Pano Mesh” first');return;}
+    const blob=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='pano_mesh.glb';
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);
+    setStatus('downloaded pano_mesh.glb ('+(blob.size/1048576).toFixed(1)+' MB)');
+  }catch(e){setStatus('download failed: '+e);}}
+function downloadShownMesh(){if(!lastMeshGlb){setStatus('generate a mesh first');return;}
+  const a=document.createElement('a');a.href='/pfile/'+lastMeshGlb;a.download=lastMeshGlb;document.body.appendChild(a);a.click();a.remove();
+  setStatus('downloading '+lastMeshGlb+'…');}
 function downloadMesh(){if(scaffoldCloud.length===0){alert('open a project first');return;}
   setStatus('generating HQ pano mesh (Poisson depth-10, ~15s) → download starts when ready…');
   const a=document.createElement('a');a.href='/download_mesh?force=1';a.download='pano_mesh.glb';document.body.appendChild(a);a.click();a.remove();}
@@ -157,16 +207,18 @@ function proj(P,B,fx){const x=P[0]-cam[0],y=P[1]-cam[1],z=P[2]-cam[2];const zc=B
 async function api(ep,body){const r=await fetch(SRV+ep,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return r.json();}
 async function refreshProjects(){const r=await api('/projects');const s=document.getElementById('projsel');
   s.innerHTML=r.projects.map(p=>`<option value="${p.name}">${p.name} (${p.steps})</option>`).join('');}
-let scaffoldCloud=[],showingMesh=false;
+let scaffoldCloud=[],showingMesh=false,lastMeshGlb=null;
 function applyDisplay(){CLOUD=scaffoldCloud;N=CLOUD.length/6;}
 function loadCloud(flat){scaffoldCloud=flat;applyDisplay();if(window.GL&&GL.ready)GL.setCloud(flat);}
-function meshUrlFor(ep){const m={'/mesh':'mesh.glb','/world_mesh':'world_mesh.glb','/accumulate':'coverage.glb'};return '/pfile/'+(m[ep]||'mesh.glb');}
+function meshUrlFor(ep){const m={'/mesh':'mesh.glb','/pano_mesh':'mesh.glb','/world_mesh':'world_mesh.glb','/accumulate':'coverage.glb'};return '/pfile/'+(m[ep]||'mesh.glb');}
 async function genMesh(ep,label){if(scaffoldCloud.length===0)return alert('open a project first');
   startTick(label||'meshing');
   try{const r=await api(ep||'/mesh',{});stopTick();
     if(r.error){setStatus('mesh error: '+r.error);return;}
+    lastMeshGlb=meshUrlFor(ep).split('/').pop();
     if(window.GL)GL.loadMesh(meshUrlFor(ep));
     const c=document.getElementById('meshchk');c.disabled=false;c.checked=true;showingMesh=true;if(window.GL)GL.showMesh(true);
+    document.getElementById('dlmeshbtn').disabled=false;
     setStatus('mesh: '+(r.nverts||'?')+' verts, '+(r.ntris||'?')+' tris (solid GLB loaded)');
   }catch(e){stopTick();setStatus('mesh failed: '+e);}}
 function toggleMesh(cb){showingMesh=cb.checked;if(window.GL)GL.showMesh(cb.checked);}
@@ -178,6 +230,14 @@ async function openProj(){const name=document.getElementById('projsel').value;if
   document.getElementById('stepcount').textContent=r.steps;resetCam();document.getElementById('film').innerHTML='';
   if(window.GL)GL.clearMesh();showingMesh=false;document.getElementById('meshchk').checked=false;
   await loadAllFrames();setStatus('project: '+name+' ('+r.steps+' steps) — ▶All to review');}
+async function deleteProj(){const name=document.getElementById('projsel').value;if(!name){setStatus('no project selected');return;}
+  if(!confirm('Delete project "'+name+'"?\nThis permanently removes it from disk and cannot be undone.'))return;
+  setStatus('deleting '+name+'…');
+  const r=await api('/delete_project',{name});
+  if(r.error){setStatus('delete failed: '+r.error);return;}
+  if(r.was_current){scaffoldCloud=[];CLOUD=[];N=0;if(window.GL){GL.setCloud([]);GL.clearMesh();}
+    document.getElementById('stepcount').textContent=0;document.getElementById('film').innerHTML='';lastMeshGlb=null;}
+  await refreshProjects();setStatus('deleted: '+name);}
 // ---- New project: in-browser upload (pick locally → multipart POST to server) ----
 let panoFile=null;
 function openNewModal(){panoFile=null;document.getElementById('newname').value='';document.getElementById('panofile').value='';
@@ -297,8 +357,10 @@ renderer.setPixelRatio(1); renderer.setClearColor(new THREE.Color(8/255,8/255,11
 const scene=new THREE.Scene();
 const cam3=new THREE.PerspectiveCamera(60,1,0.03,500);
 cam3.matrixAutoUpdate=false; cam3.matrixWorldAutoUpdate=false;   // we feed view+proj matrices by hand
-scene.add(new THREE.HemisphereLight(0xffffff,0x202028,1.15));
-const dl=new THREE.DirectionalLight(0xffffff,1.25); dl.position.set(0.6,1,0.5); scene.add(dl);
+let ambBase=0.7;                                                                  // slider-controlled base ambient
+const ambL=new THREE.AmbientLight(0xffffff,ambBase); scene.add(ambL);             // base fill so the mesh isn't dark
+const hemiL=new THREE.HemisphereLight(0xffffff,0x202028,1.0); scene.add(hemiL);
+const dl=new THREE.DirectionalLight(0xffffff,1.1); dl.position.set(0.6,1,0.5); scene.add(dl);
 const loader=new GLTFLoader();
 let points=null, meshObj=null, ptSize=2;
 function setCloud(flat){
@@ -309,7 +371,12 @@ function setCloud(flat){
   points=new THREE.Points(g,new THREE.PointsMaterial({size:ptSize,vertexColors:true,sizeAttenuation:false}));
   scene.add(points);
 }
-function loadMesh(url){loader.load(url+'?t='+Date.now(),gltf=>{if(meshObj)scene.remove(meshObj);meshObj=gltf.scene;meshObj.visible=true;scene.add(meshObj);},undefined,e=>console.warn('mesh load failed',e));}
+function loadMesh(url){loader.load(url+'?t='+Date.now(),gltf=>{if(meshObj)scene.remove(meshObj);meshObj=gltf.scene;meshObj.visible=true;
+  meshObj.traverse(o=>{if(o.isMesh&&o.material){o.material.side=THREE.DoubleSide;o.material.vertexColors=true;    // view from inside the pano, any winding
+    o.material.metalness=0;o.material.roughness=1;                 // trimesh exports metallic → black w/o env map; force pure diffuse
+    o.material.emissive=new THREE.Color(0,0,0);
+    if(!o.geometry.attributes.normal)o.geometry.computeVertexNormals();o.material.needsUpdate=true;}});
+  scene.add(meshObj);},undefined,e=>console.warn('mesh load failed',e));}
 function clearMesh(){if(meshObj){scene.remove(meshObj);meshObj=null;}const c=document.getElementById('meshchk');if(c){c.disabled=true;c.checked=false;}}
 window.GL={ready:true,
   setCloud, loadMesh, clearMesh,
@@ -317,6 +384,9 @@ window.GL={ready:true,
   setPointSize:px=>{ptSize=px;if(points)points.material.size=px;},
   showMesh:b=>{if(meshObj)meshObj.visible=b;},
   showCloud:b=>{if(points)points.visible=b;},
+  setAmbientOnly:on=>{ if(on){ambL.intensity=Math.max(1.0,+ambBase);hemiL.intensity=0;dl.intensity=0;}
+                      else {ambL.intensity=+ambBase;hemiL.intensity=1.0;dl.intensity=1.1;} },
+  setAmbient:v=>{ambBase=+v;if(!document.getElementById('ambchk').checked)ambL.intensity=+v;else ambL.intensity=Math.max(1.0,+v);},
   resize:(w,h)=>renderer.setSize(w,h,false),
   render:(cam,B,fovRad,CW,CH)=>{
     // view = world->eye (rows r,d,f) — IDENTICAL to proj()/w2cFrom on the client
