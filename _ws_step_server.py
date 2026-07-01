@@ -129,6 +129,7 @@ IDLE_CPU = 300
 _FP8_FILE = os.environ.get("WS_FP8_FILE")
 GPU = {"loaded": False, "busy": 0, "last": time.time(), "cpu_unloaded": False, "gen": False}  # gen=True = generation in flight (hard eviction guard)
 GPU_LOCK = threading.Lock()
+HEAVY_LOCK = threading.Lock()   # serialize heavy GPU endpoints (step/world_mesh/accumulate/create_project) under threaded=True
 
 def _reload_transformer():
     """Re-materialize the fp8 transformer from its on-disk file into the (meta) module
@@ -218,11 +219,12 @@ def gpu_endpoint(fn):
     def w(*a, **k):
         if request.method == "OPTIONS":
             return fn(*a, **k)
-        _gpu_ensure()
-        try:
-            return fn(*a, **k)
-        finally:
-            _gpu_done()
+        with HEAVY_LOCK:                       # only ONE heavy GPU op at a time; light requests (/log,/settings) flow freely
+            _gpu_ensure()
+            try:
+                return fn(*a, **k)
+            finally:
+                _gpu_done()
     return w
 
 def _mem_status():
@@ -1125,6 +1127,7 @@ def step():
         return ('', 204)
     if not S["proj"]:
         return jsonify({"error": "no project open"}), 400
+    _ensure_ws()                                          # load model FIRST so MODEL is set before it names memory_inputs/{MODEL}.mp4
     _snapshot()                                           # unified undo: snapshot before generating this step
     d = request.get_json()
     poses = d["frames"]; K = d["intrinsic"]; prompt = d.get("prompt", "sci-fi spaceship hangar interior, cinematic")
@@ -1188,4 +1191,4 @@ def step():
 
 if __name__ == "__main__":
     print("[server] ready on http://127.0.0.1:5005 (multi-project)", flush=True)
-    app.run(host='127.0.0.1', port=5005, threaded=False)
+    app.run(host='127.0.0.1', port=5005, threaded=True)   # threaded so /log+/settings respond DURING a long /step (no more collisions); HEAVY_LOCK serializes GPU ops
