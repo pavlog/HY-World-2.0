@@ -73,7 +73,7 @@ S = {"proj": None, "pano": None, "gpts": None, "gcol": None, "last_png": None, "
 IDLE_GPU = 60
 IDLE_CPU = 300
 _FP8_FILE = os.environ.get("WS_FP8_FILE")
-GPU = {"loaded": False, "busy": 0, "last": time.time(), "cpu_unloaded": False}   # loaded=False until WS is lazily built
+GPU = {"loaded": False, "busy": 0, "last": time.time(), "cpu_unloaded": False, "gen": False}  # gen=True = generation in flight (hard eviction guard)
 GPU_LOCK = threading.Lock()
 
 def _reload_transformer():
@@ -194,7 +194,7 @@ def _gpu_watchdog():
     while True:
         time.sleep(5)
         with GPU_LOCK:
-            if PIPE is None or GPU["busy"] != 0:      # nothing loaded yet → nothing to evict
+            if PIPE is None or GPU["busy"] != 0 or GPU["gen"]:   # not loaded / request active / GENERATING → never evict
                 continue
             idle = time.time() - GPU["last"]
             if GPU["loaded"] and idle > IDLE_GPU:                          # stage 1: free VRAM
@@ -1095,7 +1095,11 @@ def step():
         shutil.copy(f"{td}/render.mp4", f"{mem}/{MODEL}.mp4")        # first step: self-ref seed (= cloud render)
 
     t = time.time()
-    res = gen_clip(rr, prompt, torch.tensor([0], dtype=torch.long))
+    GPU["gen"] = True                                    # hard guard: watchdog must not park/evict during model-load+gen
+    try:
+        res = gen_clip(rr, prompt, torch.tensor([0], dtype=torch.long))
+    finally:
+        GPU["gen"] = False; GPU["last"] = time.time()
     dt = time.time() - t
 
     cap = cv2.VideoCapture(res); frames = []
