@@ -56,9 +56,63 @@ PROJ_ROOT = r"D:/_world_hangar/_ws_projects"; os.makedirs(PROJ_ROOT, exist_ok=Tr
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 PE_CACHE = {}
 from collections import deque
+import traceback
 LOG = deque(maxlen=300)
+
+# ---- diagnostic log (for the agent): timestamped, with a RAM/VRAM/state snapshot on every line,
+#      a background heartbeat (visible even while threaded=False blocks HTTP), and full tracebacks. ----
+DIAG_LOG = r"D:/HY-World-2.0/_ws_diag.log"
+_DIAG_LOCK = threading.Lock()
+_T0 = time.time()
+try:
+    import psutil as _psutil
+except Exception:
+    _psutil = None
+try:
+    open(DIAG_LOG, "w").close()                      # truncate on each server start
+except Exception:
+    pass
+
+def _memsnap():
+    v = -1
+    try:
+        free, tot = torch.cuda.mem_get_info(); v = round((tot - free) / 1048576)
+    except Exception:
+        pass
+    fr = pr = -1
+    if _psutil:
+        try:
+            fr = round(_psutil.virtual_memory().available / 1073741824, 1)
+            pr = round(_psutil.Process().memory_info().rss / 1073741824, 1)
+        except Exception:
+            pass
+    g = globals().get("GPU", {}) or {}
+    tr = None
+    try:
+        tr = bool(WS._STATE.get("tr_on_gpu")) if WS is not None else False
+    except Exception:
+        pass
+    parked = bool(WS_LOADED['v']) and (g.get('loaded') is False) and (g.get('cpu_unloaded') is False)
+    return (f"ramFree={fr}G proc={pr}G vram={v}M | gen={g.get('gen')} busy={g.get('busy')} "
+            f"onGpu={tr} parked={parked} unloaded={g.get('cpu_unloaded')} model={WS_LOADED['v']}")
+
+def _diag(msg):
+    line = f"[{time.time()-_T0:8.1f}s] {msg}   | {_memsnap()}"
+    with _DIAG_LOCK:
+        try:
+            with open(DIAG_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
 def logln(m):
-    LOG.append(m); print("[srv] " + m, flush=True)
+    LOG.append(m); print("[srv] " + m, flush=True); _diag(m)
+
+def _diag_heartbeat():
+    while True:
+        time.sleep(12)
+        _diag("· heartbeat")
+threading.Thread(target=_diag_heartbeat, daemon=True).start()
 S = {"proj": None, "pano": None, "gpts": None, "gcol": None, "last_png": None, "last_result": None, "step": 0, "history": [],
      # incremental, undo-aware coverage accumulation (scaffold points stay at indices [0:scaffold_n]):
      "scaffold_n": 0, "step_pts": [], "accum_step": 0, "scale": None}
@@ -386,6 +440,17 @@ app = Flask(__name__)
 def cors(r):
     r.headers['Access-Control-Allow-Origin'] = '*'; r.headers['Access-Control-Allow-Headers'] = '*'
     r.headers['Access-Control-Allow-Methods'] = '*'; return r
+
+@app.errorhandler(Exception)
+def _on_uncaught(e):
+    # log the FULL traceback to the diag file, and return JSON (not Flask's HTML 500 → no client "<!doctype" parse crash)
+    from werkzeug.exceptions import HTTPException
+    tb = traceback.format_exc()
+    logln(f"❌ EXC {getattr(request,'path','?')}: {type(e).__name__}: {e}")
+    _diag("TRACEBACK:\n" + tb)
+    GPU["gen"] = False                          # never leave the eviction guard stuck on after an error
+    code = e.code if isinstance(e, HTTPException) else 500
+    return jsonify({"error": f"{type(e).__name__}: {e}"}), code
 
 
 @app.route('/')
