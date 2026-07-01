@@ -611,36 +611,32 @@ def pano_mesh():
     return jsonify({"nverts": int(len(m.vertices)), "ntris": int(len(m.faces)), "glb": out + ".glb"})
 
 
-def _mesh_payload(pcd, outname, voxel, depth=10, fast=False):
-    import open3d as o3d
-    pts = np.asarray(pcd.points)
-    diag = float(np.linalg.norm(pts.max(0) - pts.min(0)))
-    if voxel and voxel > 0:
-        pcd = pcd.voxel_down_sample(voxel)
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=(8 if fast else 20), std_ratio=2.5)
-    logln(f"normals + Poisson (depth={depth}{', fast' if fast else ''})…")
-    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=diag * 0.02, max_nn=(16 if fast else 30)))
-    if fast:
-        pcd.orient_normals_towards_camera_location(np.array([0.0, 0.0, 0.0]))  # room interior ~origin: instant
-    else:
-        pcd.orient_normals_consistent_tangent_plane(15)                         # slow but globally consistent
-    m, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth, linear_fit=(not fast))
-    dens = np.asarray(dens); m.remove_vertices_by_mask(dens < np.quantile(dens, 0.02))
-    m.remove_degenerate_triangles(); m.remove_unreferenced_vertices(); m.compute_vertex_normals()
-    o3d.io.write_triangle_mesh(outname + ".ply", m)
-    MV = np.asarray(m.vertices); Fc = np.asarray(m.triangles)
-    MC = (np.clip(np.asarray(m.vertex_colors), 0, 1) * 255).astype(np.uint8)
-    trimesh.Trimesh(vertices=MV, faces=Fc, vertex_colors=np.concatenate([MC, np.full((len(MC), 1), 255, np.uint8)], 1),
-                    process=False).export(outname + ".glb")
-    logln(f"mesh DONE: {len(MV)} verts, {len(Fc)} tris -> {os.path.basename(outname)}.glb")
-    n = min(300000, len(MV)); idx = np.random.choice(len(MV), n, replace=False) if len(MV) > n else np.arange(len(MV))
-    Ci = np.clip(np.asarray(m.vertex_colors), 0, 1) * 255; NRM = np.asarray(m.vertex_normals)
-    flat = np.empty(len(idx) * 6)
-    flat[0::6] = np.round(MV[idx, 0], 3); flat[1::6] = np.round(MV[idx, 1], 3); flat[2::6] = np.round(MV[idx, 2], 3)
-    flat[3::6] = Ci[idx, 0]; flat[4::6] = Ci[idx, 1]; flat[5::6] = Ci[idx, 2]
-    nf = np.empty(len(idx) * 3)
-    nf[0::3] = np.round(NRM[idx, 0], 3); nf[1::3] = np.round(NRM[idx, 1], 3); nf[2::3] = np.round(NRM[idx, 2], 3)
-    return {"verts": flat.tolist(), "normals": nf.tolist(), "nverts": int(len(MV)), "ntris": int(len(Fc)), "glb": outname + ".glb"}
+def _mesh_payload(pcd, outname, voxel, depth=10, fast=False, trimq=0.02):
+    """Poisson-mesh the cloud in a SUBPROCESS (_ws_mesher.py) so an open3d C++ segfault (which no
+    try/except can catch) kills only the child, not the resident server. -> {nverts,ntris,glb} | {error}."""
+    import subprocess
+    V = np.asarray(pcd.points, np.float32); C = np.asarray(pcd.colors, np.float32)
+    npz = outname + ".in.npz"; info = outname + ".meshinfo.json"
+    np.savez(npz, V=V, C=C)
+    for p in (outname + ".glb", info):
+        try: os.remove(p)
+        except OSError: pass
+    logln(f"normals + Poisson (depth={depth}{', fast' if fast else ''}) in subprocess…")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ws_mesher.py")
+    try:
+        r = subprocess.run([sys.executable, script, npz, outname, str(depth),
+                            "1" if fast else "0", str(voxel), str(trimq)],
+                           capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        return {"error": f"mesher subprocess error: {e}"}
+    if not os.path.exists(info):
+        logln(f"mesher crashed (rc={r.returncode}): {(r.stderr or '')[-300:]}")
+        return {"error": "meshing failed (open3d crashed) — use the max-quality Pano Mesh instead"}
+    d = json.load(open(info))
+    if "error" in d:
+        return {"error": d["error"]}
+    logln(f"mesh DONE (subproc): {d['nverts']} verts, {d['ntris']} tris → {os.path.basename(outname)}.glb")
+    return {"nverts": int(d["nverts"]), "ntris": int(d["ntris"]), "glb": outname + ".glb"}
 
 
 @app.route('/fastmesh', methods=['POST', 'OPTIONS'])
