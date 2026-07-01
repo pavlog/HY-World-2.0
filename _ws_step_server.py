@@ -319,6 +319,8 @@ def gen_clip(rr, prompt, ref_index):
     kwargs.update(prompt=None, prompt_embeds=pe, negative_prompt_embeds=ne,
                   generator=torch.Generator(device=dev).manual_seed(1024), output_type="pt",
                   latent_cond_mode=cfg.latent_cond_mode, mode="test", num_frames=cfg.nframe, ref_index=ri)
+    if not WS._STATE.get("tr_on_gpu"):                    # cached-prompt path skips the umt5 swap that would move it → ensure it's on GPU
+        PIPE.transformer.to(dev); WS._STATE["tr_on_gpu"] = True; torch.cuda.empty_cache()
     logln("denoising (4-step DMD)…")
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         out = PIPE(**kwargs).frames[0].float()
